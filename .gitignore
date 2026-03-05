@@ -1,0 +1,8 @@
+.env
+.env.local
+.next/
+node_modules/
+data/pdfs/
+data/parsed/
+*.pyc
+__pycache__/

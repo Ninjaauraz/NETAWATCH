@@ -1,0 +1,141 @@
+// lib/seed.js
+// Used when Supabase is not configured — app works fully offline with this data.
+// Replace with real ECI data as the scraper produces it.
+
+export const SEED_POLITICIANS = [
+  {
+    id: "1",
+    name: "Arvind Mehta",
+    party: "BJP", state: "Maharashtra",
+    constituency: "Mumbai North",
+    role: "Minister of Telecommunications",
+    age: 54,
+    totalAssets:    { 2009:1.8, 2014:4.2, 2019:18.7, 2024:64.3 },
+    liabilities:    { 2009:0.4, 2014:1.1, 2019:3.2,  2024:6.8  },
+    declaredIncome: { 2019:0.42,2020:0.48,2021:0.51,2022:0.55,2023:0.58 },
+    holdings: [
+      { sector:"Telecom",     value:28.4, conflict:true  },
+      { sector:"Real Estate", value:19.6, conflict:false },
+      { sector:"Banking",     value:16.3, conflict:false },
+    ],
+    tradeEvents: [
+      { date:"2018-04-01", policyDate:"2018-09-01", isFamilyMember:false, valueCr:8   },
+      { date:"2017-11-01", policyDate:"2018-09-01", isFamilyMember:true,  valueCr:6   },
+    ],
+    criminalCases: [
+      { case:"Land encroachment FIR",   status:"DROPPED",   resolvedYear:2017, note:"Dropped 1yr after joining BJP"     },
+      { case:"Money laundering (ED)",    status:"DROPPED",   resolvedYear:2017, note:"Dropped same year as party switch" },
+      { case:"Disproportionate assets",  status:"ACQUITTED", resolvedYear:2019, note:"Acquitted pre-election"            },
+    ],
+    partyHistory: [
+      { party:"INC", from:2004, to:2012 },
+      { party:"NCP", from:2012, to:2016 },
+      { party:"BJP", from:2016, to:2024 },
+    ],
+    network: [
+      { name:"Sunita Mehta",          type:"spouse",        holdingsInConflictSectors:true,  tradeBeforePolicy:true,  govtContractWon:false                     },
+      { name:"Rohan Mehta",           type:"child",         holdingsInConflictSectors:false, tradeBeforePolicy:false, govtContractWon:true,  contractValueCr:22  },
+      { name:"Vijay Contractors Ltd", type:"shell_company", holdingsInConflictSectors:false, tradeBeforePolicy:false, govtContractWon:true,  contractValueCr:340 },
+    ],
+    disclosure: { lateFilings:0, amendmentsAfterMedia:1, assetsFoundInAudit:1, missingYears:0 },
+    timeline: [
+      { date:"Jan 2016", event:"Joined BJP from NCP",                   type:"party"              },
+      { date:"Mar 2016", event:"ED & land case dropped within 60 days", type:"legal",  flag:true  },
+      { date:"Aug 2017", event:"Appointed Telecom Minister",            type:"appt"               },
+      { date:"Nov 2017", event:"Spouse buys ₹6Cr Airtel",              type:"trade",  flag:true  },
+      { date:"Feb 2018", event:"5G policy drafted — classified",        type:"policy"             },
+      { date:"Apr 2018", event:"Directly buys ₹8Cr Airtel",            type:"trade",  flag:true  },
+      { date:"Sep 2018", event:"5G policy publicly announced",          type:"policy"             },
+      { date:"Dec 2018", event:"Airtel +34% — family gain ₹4.9Cr",     type:"gain",   flag:true  },
+      { date:"Jun 2019", event:"Son wins ₹22Cr ministry contract",      type:"contract",flag:true },
+    ],
+  },
+  {
+    id: "2",
+    name: "Priya Nair",
+    party: "INC", state: "Kerala",
+    constituency: "Thiruvananthapuram",
+    role: "Minister of Pharmaceuticals",
+    age: 47,
+    totalAssets:    { 2009:0.8, 2014:2.1, 2019:9.4,  2024:31.8 },
+    liabilities:    { 2009:0.2, 2014:0.5, 2019:1.8,  2024:4.1  },
+    declaredIncome: { 2019:0.38,2020:0.41,2021:0.44,2022:0.47,2023:0.50 },
+    holdings: [
+      { sector:"Pharma",     value:14.2, conflict:true  },
+      { sector:"Healthcare", value:9.1,  conflict:true  },
+      { sector:"FMCG",       value:8.5,  conflict:false },
+    ],
+    tradeEvents: [
+      { date:"2021-02-01", policyDate:"2021-04-01", isFamilyMember:true, valueCr:5   },
+      { date:"2021-11-01", policyDate:"2022-02-01", isFamilyMember:true, valueCr:3.2 },
+    ],
+    criminalCases: [
+      { case:"Misuse of public funds (CAG)", status:"PENDING", resolvedYear:null, note:"No hearing in 8 years" },
+    ],
+    partyHistory: [
+      { party:"AAP", from:2013, to:2018 },
+      { party:"INC", from:2018, to:2024 },
+    ],
+    network: [
+      { name:"Anand Nair",      type:"spouse",        holdingsInConflictSectors:true,  tradeBeforePolicy:true,  govtContractWon:false                      },
+      { name:"Dr. Anil Nair",   type:"sibling",       holdingsInConflictSectors:true,  tradeBeforePolicy:true,  govtContractWon:true,  contractValueCr:180  },
+      { name:"MedCore Pvt Ltd", type:"shell_company", holdingsInConflictSectors:false, tradeBeforePolicy:false, govtContractWon:true,  contractValueCr:45   },
+    ],
+    disclosure: { lateFilings:1, amendmentsAfterMedia:0, assetsFoundInAudit:0, missingYears:0 },
+    timeline: [
+      { date:"Mar 2018", event:"Joined INC from AAP",                   type:"party"              },
+      { date:"Dec 2019", event:"Appointed Pharma Minister",             type:"appt"               },
+      { date:"Jan 2021", event:"COVID vaccine policy drafted (secret)",  type:"policy"             },
+      { date:"Feb 2021", event:"Husband buys Sun Pharma ₹5Cr",          type:"trade",  flag:true  },
+      { date:"Apr 2021", event:"Vaccine rollout announced publicly",     type:"policy"             },
+      { date:"Jul 2021", event:"Sun Pharma +28% — gain ₹1.4Cr",         type:"gain",   flag:true  },
+      { date:"Nov 2021", event:"Brother buys Apollo ₹3.2Cr",            type:"trade",  flag:true  },
+      { date:"Feb 2022", event:"Apollo wins ₹180Cr health contract",    type:"contract",flag:true },
+    ],
+  },
+  {
+    id: "3",
+    name: "Ramesh Patil",
+    party: "NCP", state: "Maharashtra",
+    constituency: "Pune Rural",
+    role: "Minister of Infrastructure",
+    age: 61,
+    totalAssets:    { 2009:5.2, 2014:8.6, 2019:22.1, 2024:41.0 },
+    liabilities:    { 2009:1.1, 2014:2.3, 2019:5.6,  2024:9.2  },
+    declaredIncome: { 2019:0.55,2020:0.60,2021:0.62,2022:0.65,2023:0.70 },
+    holdings: [
+      { sector:"Construction", value:11.3, conflict:true  },
+      { sector:"Cement",       value:9.8,  conflict:true  },
+      { sector:"Banking",      value:19.9, conflict:false },
+    ],
+    tradeEvents: [
+      { date:"2018-09-01", policyDate:"2018-12-01", isFamilyMember:false, valueCr:4 },
+    ],
+    criminalCases: [
+      { case:"Illegal mining FIR",       status:"DROPPED", resolvedYear:2009, note:"Dropped after INC switch"        },
+      { case:"Tender fraud (CBI)",        status:"DROPPED", resolvedYear:2017, note:"Dropped after 8 years"          },
+      { case:"Benami property (IT Dept)", status:"DROPPED", resolvedYear:2017, note:"Dropped same year as NCP switch" },
+      { case:"Forest land encroachment",  status:"PENDING", resolvedYear:null, note:"Stalled since 2018"             },
+    ],
+    partyHistory: [
+      { party:"BJP", from:2002, to:2008 },
+      { party:"INC", from:2008, to:2016 },
+      { party:"NCP", from:2016, to:2024 },
+    ],
+    network: [
+      { name:"Sushma Patil",       type:"spouse",        holdingsInConflictSectors:true,  tradeBeforePolicy:false, govtContractWon:false                      },
+      { name:"Patil Cement Works", type:"shell_company", holdingsInConflictSectors:false, tradeBeforePolicy:false, govtContractWon:true,  contractValueCr:120  },
+      { name:"BuildRight Infra",   type:"associate",     holdingsInConflictSectors:false, tradeBeforePolicy:false, govtContractWon:true,  contractValueCr:820  },
+    ],
+    disclosure: { lateFilings:0, amendmentsAfterMedia:0, assetsFoundInAudit:1, missingYears:0 },
+    timeline: [
+      { date:"Feb 2016", event:"Joined NCP from INC",                    type:"party"              },
+      { date:"Mar 2017", event:"3 cases dropped in same quarter",         type:"legal",  flag:true  },
+      { date:"Jul 2018", event:"Appointed Infrastructure Minister",       type:"appt"               },
+      { date:"Sep 2018", event:"Buys L&T shares ₹4Cr",                   type:"trade",  flag:true  },
+      { date:"Dec 2018", event:"₹2,400Cr highway budget — he drafted it", type:"policy"             },
+      { date:"Mar 2019", event:"BuildRight wins ₹820Cr tenders",          type:"contract",flag:true },
+      { date:"Jan 2023", event:"Family cement firm found in CAG audit",   type:"legal",  flag:true  },
+    ],
+  },
+];
