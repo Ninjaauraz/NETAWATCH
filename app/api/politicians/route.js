@@ -1,4 +1,5 @@
-// app/api/politicians/[id]/route.js
+// app/api/politicians/[id]/route.js 
+export const dynamic = "force-dynamic";
 import { supabase } from "@/lib/supabase";
 import { SEED_POLITICIANS } from "@/lib/seed";
 import { scorePolitician } from "@/lib/scoring";
