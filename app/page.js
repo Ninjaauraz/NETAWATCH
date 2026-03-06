@@ -4,14 +4,11 @@ import NetaWatchClient, { scoreBatch } from "../components/NetaWatchClient";
 import { SEED_POLITICIANS } from "../lib/seed";
 
 export default function Home() {
-  const [politicians, setPoliticians] = useState(() => scoreBatch(SEED_POLITICIANS));
+  // Start with scored seed data so the page renders immediately
+  const [politicians] = useState(() => scoreBatch(SEED_POLITICIANS));
 
-  useEffect(() => {
-    fetch("/politicians.json")
-      .then(r => r.ok ? r.json() : null)
-      .then(data => { if (data?.length > 0) setPoliticians(scoreBatch(data)); })
-      .catch(() => {});
-  }, []);
-
+  // The SSE stream at /api/stream sends a full "init" event with live-scored data,
+  // so NetaWatchClient handles its own live updates internally.
+  // This page just needs to provide the initial render-blocking fallback.
   return <NetaWatchClient initialData={politicians} />;
 }
