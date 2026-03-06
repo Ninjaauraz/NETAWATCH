@@ -152,8 +152,8 @@ function Timeline({ events }) {
 
 // ─── POLITICIAN CARD (list item) ──────────────────────────────────────────────
 function PolCard({ p, onClick, hasNews }) {
-  const sc  = p._s;
-  const t   = TIER[sc.tier];
+  const sc  = p._s || computeScore(p);
+  const t   = TIER[sc.tier] || TIER.clear;
   const pc  = partyColor(p.party);
   const [imgErr, setImgErr] = useState(false);
   const photo = proxy(p.photo);
@@ -206,8 +206,8 @@ function PolCard({ p, onClick, hasNews }) {
 
 // ─── DETAIL SHEET ─────────────────────────────────────────────────────────────
 function DetailSheet({ p, news, onClose }) {
-  const sc   = p._s;
-  const t    = TIER[sc.tier];
+  const sc   = p._s || computeScore(p);
+  const t    = TIER[sc.tier] || TIER.clear;
   const pc   = partyColor(p.party);
   const sheetRef = useRef(null);
   const [imgErr, setImgErr] = useState(false);
@@ -501,7 +501,10 @@ export default function NetaWatchClient({ initialData }) {
     const connect = () => {
       src = new EventSource("/api/stream");
       src.addEventListener("init", e => {
-        setPols(JSON.parse(e.data).politicians);
+        const incoming = JSON.parse(e.data).politicians || [];
+        // Ensure every politician has ._s (guard against schema mismatch)
+        const safe = incoming.map(p => p._s ? p : { ...p, _s: computeScore(p) });
+        setPols(safe);
         setConn(true);
       });
       src.addEventListener("news", e => {
@@ -519,7 +522,7 @@ export default function NetaWatchClient({ initialData }) {
 
   const sorted = useMemo(() => {
     const arr = [...pols];
-    if (sortBy === "score")  arr.sort((a, b) => b._s.final - a._s.final);
+    if (sortBy === "score")  arr.sort((a, b) => (b._s?.final || 0) - (a._s?.final || 0));
     if (sortBy === "wealth") arr.sort((a, b) => (b._s?.netWorth || 0) - (a._s?.netWorth || 0));
     if (sortBy === "cases")  arr.sort((a, b) => (b._s?.pendingCases || 0) - (a._s?.pendingCases || 0));
     if (sortBy === "name")   arr.sort((a, b) => a.name.localeCompare(b.name));
