@@ -1,1077 +1,850 @@
 "use client";
-import { useState, useMemo, useEffect, useRef, useCallback } from "react";
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 
-// ─── SCORING ENGINE (inline, works with single-year ECI data) ─────────────────
-const WEIGHTS = { wealth:0.28, cases:0.22, network:0.18, disclosure:0.12, timing:0.12, conflict:0.08 };
+// ─── SCORING ──────────────────────────────────────────────────────────────────
+export function computeScore(p) {
+  const yrs     = Object.keys(p.totalAssets || {}).sort();
+  const latest  = p.totalAssets?.[yrs[yrs.length-1]] || 0;
+  const first   = p.totalAssets?.[yrs[0]] || 0;
+  const income  = Object.values(p.declaredIncome || {}).reduce((a,b)=>a+b,0);
+  const cases   = p.criminalCases || [];
+  const pending = cases.filter(c => c.status === "PENDING");
+  const dropped = cases.filter(c => c.status === "DROPPED");
+  const net     = p.network || [];
 
-function scoreWealth({ totalAssets, declaredIncome }) {
-  const vals   = Object.values(totalAssets || {});
-  const years  = Object.keys(totalAssets || {}).map(Number).sort();
-  const latest = vals[vals.length - 1] || 0;
-  const declared = Object.values(declaredIncome || {}).reduce((a, b) => a + b, 0);
-  if (years.length >= 2) {
-    const growth = latest - (totalAssets[years[0]] || 0);
-    if (declared > 0) {
-      const r = growth / declared;
-      if (r <= 1)  return Math.round(r * 18);
-      if (r <= 5)  return Math.round(18 + ((r-1)/4)*30);
-      if (r <= 15) return Math.round(48 + ((r-5)/10)*27);
-      if (r <= 30) return Math.round(75 + ((r-15)/15)*15);
-      return 95;
-    }
+  // Wealth gap: how much growth vs declared income
+  let wealthScore = 0;
+  if (yrs.length >= 2 && income > 0) {
+    const r = (latest - first) / income;
+    wealthScore = r<=1?r*18 : r<=5?18+(r-1)/4*30 : r<=15?48+(r-5)/10*27 : Math.min(75+(r-15)/15*15, 96);
+  } else {
+    wealthScore = latest<=4.5 ? (latest/4.5)*17 : latest<=50 ? 17+(latest-4.5)/45.5*43 : Math.min(60+(latest-50)/200*36, 97);
   }
-  // Single year: score vs ₹4.5Cr lifetime public salary ceiling
-  if (latest <= 1)   return 5;
-  if (latest <= 4.5) return Math.round(5 + (latest/4.5)*12);
-  if (latest <= 15)  return Math.round(17 + ((latest-4.5)/10.5)*20);
-  if (latest <= 50)  return Math.round(37 + ((latest-15)/35)*25);
-  if (latest <= 200) return Math.round(62 + ((latest-50)/150)*20);
-  return Math.min(82 + Math.round((latest-200)/100), 96);
-}
 
-function scoreCases({ criminalCases, partyHistory }) {
-  if (!criminalCases?.length) return 0;
-  const pending = criminalCases.filter(c => c.status === "PENDING");
-  const serious = pending.filter(c => /302|307|ED|CBI|launder|benami|murder|rape|dacoity|terror/i.test(c.case + (c.note||"")));
-  const dropped = criminalCases.filter(c => c.status === "DROPPED" && c.resolvedYear);
-  let s = Math.min(pending.length * 11, 55) + Math.min(serious.length * 14, 35);
-  if (dropped.length && partyHistory?.length > 1) {
-    const switches = partyHistory.slice(1).map(p => p.from);
-    dropped.forEach(c => {
-      if (switches.some(yr => Math.abs(c.resolvedYear - yr) <= 2)) s += 18;
-    });
+  // Cases: pending count + suspicious drops near party switches
+  let caseScore = Math.min(pending.length * 12 + pending.filter(c=>/ED|CBI|murder|launder|benami/i.test(c.case||"")).length * 15, 100);
+  if (dropped.length && p.partyHistory?.length > 1) {
+    const switchYears = p.partyHistory.slice(1).map(x => x.from);
+    dropped.forEach(d => { if (d.resolvedYear && switchYears.some(y => Math.abs(d.resolvedYear - y) <= 2)) caseScore = Math.min(caseScore + 20, 100); });
   }
-  return Math.min(s, 100);
-}
 
-function scoreNetwork({ network }) {
-  if (!network?.length) return 0;
-  const W = { spouse:1.0, child:0.9, sibling:0.7, parent:0.6, associate:0.8, shell_company:1.0 };
-  let total = 0;
-  network.forEach(n => {
-    const w = W[n.type] || 0.5;
-    let s = 0;
-    if (n.holdingsInConflictSectors) s += 25;
-    if (n.tradeBeforePolicy)         s += 35;
-    if (n.govtContractWon)           s += 30 + Math.min(Math.log10(Math.max(n.contractValueCr||1,1))*5, 15);
-    total += s * w;
+  // Network: family/associates with contracts or insider trades
+  const PW = { spouse:1, child:.9, sibling:.7, associate:.8, shell_company:1 };
+  let netRisk = 0;
+  net.forEach(n => {
+    const w = PW[n.type] || .5;
+    netRisk += ((n.tradeBeforePolicy?38:0) + (n.govtContractWon?32+Math.min(Math.log10(Math.max(n.contractValueCr||1,1))*6,18):0) + (n.holdingsInConflictSectors?20:0)) * w;
   });
-  return Math.min(Math.round((total / (network.length * 100)) * 150), 100);
-}
+  const networkScore = Math.min((netRisk / Math.max(net.length, 1) / 100) * 150, 100);
 
-function scoreDisclosure({ disclosure }) {
-  if (!disclosure) return 0;
-  const { lateFilings=0, amendmentsAfterMedia=0, assetsFoundInAudit=0, missingYears=0 } = disclosure;
-  return Math.min(lateFilings*8 + amendmentsAfterMedia*15 + assetsFoundInAudit*25 + missingYears*20, 100);
-}
+  // Trade timing
+  const trades = p.tradeEvents || [];
+  const tradeScore = !trades.length ? 0 : Math.min(
+    trades.map(e => { const d=(new Date(e.policyDate)-new Date(e.date))/86400000; return d<=0?0:d<=30?92:d<=90?68:d<=180?38:14; })
+      .sort((a,b)=>b-a).reduce((s,v,i)=>s+(i===0?v:v*.25),0), 100);
 
-function scoreTiming({ tradeEvents }) {
-  if (!tradeEvents?.length) return 0;
-  const scores = tradeEvents.map(e => {
-    const days = (new Date(e.policyDate) - new Date(e.date)) / 86400000;
-    if (days <= 0) return 0;
-    let s = days<=30?90 : days<=90?65 : days<=180?35 : days<=365?15 : 5;
-    return s * Math.min(1 + Math.log10(Math.max(e.valueCr,0.1))*0.1, 1.3);
-  }).sort((a,b) => b-a);
-  return Math.min(Math.round(scores[0] + scores.slice(1).reduce((s,v) => s+v*0.2, 0)), 100);
-}
+  // Disclosure failures
+  const disc = p.disclosure || {};
+  const discScore = Math.min((disc.lateFilings||0)*8+(disc.amendmentsAfterMedia||0)*18+(disc.assetsFoundInAudit||0)*28+(disc.missingYears||0)*22, 100);
 
-function scoreConflict({ holdings }) {
-  if (!holdings?.length) return 0;
-  const total = holdings.reduce((s,h) => s+h.value, 0);
-  const bad   = holdings.filter(h=>h.conflict).reduce((s,h) => s+h.value, 0);
-  const pct   = total > 0 ? (bad/total)*100 : 0;
-  return Math.min(Math.round(pct*0.85) + holdings.filter(h=>h.conflict).length*5, 100);
-}
+  const final = Math.round(wealthScore*.28 + caseScore*.22 + networkScore*.18 + tradeScore*.16 + discScore*.10 + Math.min((p.holdings||[]).filter(h=>h.conflict).length*16,100)*.06);
+  const tier  = final>=80?"CRITICAL":final>=60?"HIGH":final>=38?"ELEVATED":final>=18?"LOW":"CLEAR";
 
-function computeScore(p) {
-  const sub = {
-    wealth:     scoreWealth(p),
-    cases:      scoreCases(p),
-    network:    scoreNetwork(p),
-    disclosure: scoreDisclosure(p),
-    timing:     scoreTiming(p),
-    conflict:   scoreConflict(p),
-  };
-  const final = Math.round(Object.entries(WEIGHTS).reduce((s,[k,w]) => s+sub[k]*w, 0));
-  const tier = final >= 80 ? "CRITICAL" : final >= 60 ? "HIGH" : final >= 40 ? "ELEVATED" : final >= 20 ? "LOW" : "CLEAR";
-  return { final, sub, tier };
+  return { final, tier, wealthScore:Math.round(wealthScore), caseScore, networkScore:Math.round(networkScore), tradeScore:Math.round(tradeScore), discScore, netWorth:latest, pendingCases:pending.length, unexplained:Math.max(0,latest-4.5) };
 }
 
 export function scoreBatch(arr) {
-  return arr.map(p => ({ ...p, score: computeScore(p) })).sort((a,b) => b.score.final - a.score.final);
+  return arr.map(p => ({ ...p, _score: computeScore(p) })).sort((a,b) => b._score.final - a._score.final);
 }
 
-// ─── COLOUR SYSTEM ────────────────────────────────────────────────────────────
-const TIER_COLOR = { CRITICAL:"#FF1A1A", HIGH:"#FF6B00", ELEVATED:"#FFB800", LOW:"#4ADE80", CLEAR:"#22D3EE" };
-const PARTY_HUE  = { BJP:"#FF5722", INC:"#2196F3", TMC:"#009688", AAP:"#00BCD4", NCP:"#9C27B0",
-  SP:"#FF5252", BSP:"#1565C0", DMK:"#D32F2F", JDU:"#00838F", RJD:"#E91E63",
-  CPI:"#C62828", AAP:"#00ACC1", IND:"#78909C" };
-const pColor = p => PARTY_HUE[p?.toUpperCase()] || "#78909C";
+// ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
+const BG    = "#0f0900";
+const AMBER = "#ffb340";
+const DIM   = "#5a3e1b";
+const MID   = "#a06820";
+const GLOW  = "rgba(255,179,64,0.12)";
 
-function proxyPhoto(url) {
-  if (!url) return "";
-  if (url.includes("weserv.nl")) return url;
-  if (url.includes("wikimedia") || url.includes("wikipedia"))
-    return `https://images.weserv.nl/?url=${encodeURIComponent(url)}&w=200&h=200&fit=cover`;
-  return url;
-}
+const TIER_STYLE = {
+  CRITICAL: { color:"#ff453a", glow:"rgba(255,69,58,0.25)",  label:"CRITICAL"  },
+  HIGH:     { color:"#ff9f0a", glow:"rgba(255,159,10,0.2)",  label:"HIGH RISK" },
+  ELEVATED: { color:"#ffd60a", glow:"rgba(255,214,10,0.18)", label:"ELEVATED"  },
+  LOW:      { color:"#32d74b", glow:"rgba(50,215,75,0.15)",  label:"LOW RISK"  },
+  CLEAR:    { color:"#0a84ff", glow:"rgba(10,132,255,0.15)", label:"CLEAR"     },
+};
 
-// ─── FONT LOADER ──────────────────────────────────────────────────────────────
-function useFonts() {
-  useEffect(() => {
-    const link = document.createElement("link");
-    link.rel  = "stylesheet";
-    link.href = "https://fonts.googleapis.com/css2?family=Bebas+Neue&family=JetBrains+Mono:wght@400;600;800&family=Crimson+Pro:ital,wght@0,400;0,600;1,400&display=swap";
-    document.head.appendChild(link);
-  }, []);
-}
+const PARTY_COLORS = {
+  BJP:"#ff6b35", INC:"#4a9eff", TMC:"#00d4aa", AAP:"#00c8ff",
+  NCP:"#c77dff", SP:"#ff4d6d", BSP:"#4361ee", DMK:"#e63946", IND:"#8d8d8d",
+};
+const pColor = p => PARTY_COLORS[p?.toUpperCase()] || "#8d8d8d";
 
-// ─── THREAT METER ─────────────────────────────────────────────────────────────
-function ThreatMeter({ score, tier }) {
-  const color = TIER_COLOR[tier];
-  const [display, setDisplay] = useState(0);
-  useEffect(() => {
-    let v = 0;
-    const step = score / 40;
-    const t = setInterval(() => {
-      v = Math.min(v + step, score);
-      setDisplay(Math.round(v));
-      if (v >= score) clearInterval(t);
-    }, 16);
-    return () => clearInterval(t);
-  }, [score]);
-
-  const segments = 20;
-  return (
-    <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
-      <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:48, fontWeight:800,
-        color, lineHeight:1, textShadow:`0 0 30px ${color}88`, letterSpacing:-2 }}>
-        {String(display).padStart(2,"0")}
-      </div>
-      <div style={{ display:"flex", gap:2 }}>
-        {Array.from({length:segments}).map((_,i) => {
-          const filled = i < Math.round((score/100)*segments);
-          const segColor = i < 8 ? "#4ADE80" : i < 13 ? "#FFB800" : i < 17 ? "#FF6B00" : "#FF1A1A";
-          return (
-            <div key={i} style={{ width:6, height:24, borderRadius:1,
-              background: filled ? segColor : "#1A1A1A",
-              boxShadow: filled ? `0 0 6px ${segColor}88` : "none",
-              transition:`all ${0.02*i}s ease` }}/>
-          );
-        })}
-      </div>
-      <div style={{ fontFamily:"'Bebas Neue',cursive", fontSize:14, letterSpacing:3,
-        color, textShadow:`0 0 10px ${color}` }}>{tier}</div>
-    </div>
-  );
-}
-
-// ─── SCANLINES BOOT EFFECT ────────────────────────────────────────────────────
-function ScanEffect() {
-  const [show, setShow] = useState(true);
-  useEffect(() => { setTimeout(() => setShow(false), 1800); }, []);
-  if (!show) return null;
-  return (
-    <div style={{ position:"fixed", inset:0, zIndex:9999, pointerEvents:"none",
-      background:"#000", animation:"fadeout 0.4s 1.4s forwards" }}>
-      <div style={{ position:"absolute", inset:0,
-        backgroundImage:"repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(255,255,255,0.03) 2px, rgba(255,255,255,0.03) 4px)",
-        animation:"scandown 1.4s linear" }}/>
-      <div style={{ position:"absolute", top:"50%", left:"50%", transform:"translate(-50%,-50%)",
-        fontFamily:"'JetBrains Mono',monospace", color:"#FF1A1A", fontSize:11, letterSpacing:3,
-        textAlign:"center", lineHeight:2 }}>
-        <div style={{marginBottom:8}}>NETAWATCH INTELLIGENCE SYSTEM</div>
-        <div style={{color:"#333"}}>LOADING CLASSIFIED DATA...</div>
-        <div style={{color:"#222", marginTop:4}}>AUTHORISED ACCESS ONLY</div>
-      </div>
-    </div>
-  );
-}
-
-// ─── REDACT ───────────────────────────────────────────────────────────────────
-function Redact({ children, reveal=false }) {
-  const [open, setOpen] = useState(reveal);
-  if (open) return <span>{children}</span>;
-  return (
-    <span onClick={() => setOpen(true)} title="Click to reveal" style={{
-      background:"#222", color:"transparent", borderRadius:2, cursor:"pointer",
-      userSelect:"none", padding:"0 2px", letterSpacing:-1,
-      border:"1px solid #333",
-    }}>{"█".repeat(String(children).length)}</span>
-  );
-}
-
-// ─── EVIDENCE CHAIN (timeline) ────────────────────────────────────────────────
-function EvidenceChain({ timeline }) {
-  if (!timeline?.length) return (
-    <div style={{color:"#444", fontFamily:"'JetBrains Mono',monospace", fontSize:11, padding:"20px 0"}}>
-      NO TIMELINE DATA ON RECORD
-    </div>
-  );
-
-  const typeColor = { party:"#9B59B6", legal:"#FF1A1A", appt:"#3498DB", trade:"#F39C12",
-    policy:"#555", gain:"#2ECC71", contract:"#FF1A1A" };
-
-  return (
-    <div style={{ position:"relative", paddingLeft:24 }}>
-      {/* Vertical wire */}
-      <div style={{ position:"absolute", left:8, top:8, bottom:8, width:1,
-        background:"linear-gradient(to bottom, transparent, #FF1A1A44, #FF1A1A44, transparent)" }}/>
-
-      {timeline.map((t, i) => {
-        const color = typeColor[t.type] || "#555";
-        return (
-          <div key={i} style={{ display:"flex", gap:16, marginBottom:20, position:"relative" }}>
-            {/* Node */}
-            <div style={{ position:"absolute", left:-20, top:4, width:10, height:10, borderRadius:"50%",
-              background: t.flag ? "#FF1A1A" : color,
-              boxShadow: t.flag ? "0 0 12px #FF1A1A" : "none",
-              border:`2px solid ${color}`,
-              flexShrink:0, zIndex:1,
-              animation: t.flag ? "pulse-red 1.5s infinite" : "none" }}/>
-
-            <div style={{ flex:1, background:"#0F0F0F", border:`1px solid ${t.flag ? "#FF1A1A33" : "#1E1E1E"}`,
-              borderRadius:4, padding:"10px 14px",
-              boxShadow: t.flag ? "0 0 20px #FF1A1A11" : "none" }}>
-              <div style={{ display:"flex", justifyContent:"space-between", marginBottom:4 }}>
-                <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#444",
-                  textTransform:"uppercase", letterSpacing:1 }}>{t.date}</span>
-                <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, color,
-                  textTransform:"uppercase", letterSpacing:2,
-                  border:`1px solid ${color}22`, padding:"1px 6px", borderRadius:2 }}>{t.type}</span>
-              </div>
-              <div style={{ fontFamily:"'Crimson Pro',serif", fontSize:14, color: t.flag ? "#FFF" : "#AAA",
-                lineHeight:1.5 }}>
-                {t.flag && <span style={{color:"#FF1A1A",marginRight:6}}>▲</span>}
-                {t.event}
-              </div>
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// ─── ASSET CHART ──────────────────────────────────────────────────────────────
-function AssetChart({ totalAssets, liabilities }) {
-  const years = Object.keys(totalAssets || {}).sort();
-  if (years.length < 2) {
-    // Single year — comparison bars
-    const val = Object.values(totalAssets||{})[0] || 0;
-    const maxV = Math.max(val, 15);
-    return (
-      <div>
-        {[["DECLARED NET WORTH", val, "#FF1A1A"], ["AVG MP (ADR 2024)", 14.7, "#444"],
-          ["30YR GOVT SALARY", 4.5, "#2A2A2A"]].map(([l,v,c],i) => (
-          <div key={i} style={{marginBottom:12}}>
-            <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
-              <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,color:"#555",letterSpacing:1}}>{l}</span>
-              <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:c,fontWeight:800}}>₹{v}CR</span>
-            </div>
-            <div style={{height:6,background:"#111",borderRadius:2,overflow:"hidden"}}>
-              <div style={{width:`${(v/maxV)*100}%`,height:"100%",background:c,
-                boxShadow:i===0?`0 0 8px ${c}`:undefined,
-                transition:"width 1s ease",borderRadius:2}}/>
-            </div>
-          </div>
-        ))}
-        <div style={{marginTop:12,fontFamily:"'JetBrains Mono',monospace",fontSize:9,color:"#333",
-          borderTop:"1px solid #1A1A1A",paddingTop:8}}>
-          EXPLAINABLE GAP: ₹{Math.max(0,val-4.5).toFixed(1)}CR UNEXPLAINED WEALTH
-        </div>
-      </div>
-    );
+// ─── WAVEFORM GENERATOR ───────────────────────────────────────────────────────
+// Generates a deterministic SVG waveform path for a politician's signal
+function generateWaveform(score, seed, width=200, height=32) {
+  const pts = [];
+  let x = seed * 137.508; // golden angle offset for variety
+  for (let i = 0; i <= width; i += 4) {
+    const noise = Math.sin(i * 0.08 + x) * 0.5 + Math.sin(i * 0.19 + x*1.3) * 0.3 + Math.sin(i * 0.41 + x*0.7) * 0.2;
+    const amp = (score / 100) * (height * 0.42);
+    const y = height/2 - noise * amp;
+    pts.push(`${i},${y.toFixed(1)}`);
   }
-
-  const data = years.map(y => ({
-    y, assets: totalAssets[y], liab: liabilities?.[y] || 0,
-    net: totalAssets[y] - (liabilities?.[y] || 0),
-  }));
-
-  return (
-    <ResponsiveContainer width="100%" height={160}>
-      <AreaChart data={data}>
-        <defs>
-          <linearGradient id="redGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#FF1A1A" stopOpacity={0.3}/>
-            <stop offset="100%" stopColor="#FF1A1A" stopOpacity={0}/>
-          </linearGradient>
-        </defs>
-        <XAxis dataKey="y" tick={{fill:"#444",fontSize:10,fontFamily:"'JetBrains Mono',monospace"}}
-          axisLine={false} tickLine={false}/>
-        <YAxis tick={{fill:"#444",fontSize:10,fontFamily:"'JetBrains Mono',monospace"}}
-          axisLine={false} tickLine={false}/>
-        <Tooltip contentStyle={{background:"#111",border:"1px solid #222",
-          fontFamily:"'JetBrains Mono',monospace",fontSize:10,color:"#CCC"}}
-          labelStyle={{color:"#555",marginBottom:4}}/>
-        <Area dataKey="assets" name="ASSETS" stroke="#FF1A1A" strokeWidth={2}
-          fill="url(#redGrad)" dot={{fill:"#FF1A1A",r:3}}/>
-        <Area dataKey="liab" name="LIABILITIES" stroke="#333" strokeWidth={1}
-          fill="none" strokeDasharray="4 2"/>
-      </AreaChart>
-    </ResponsiveContainer>
-  );
+  return `M ${pts.join(" L ")}`;
 }
 
-// ─── SUBJECT CARD (sidebar) ───────────────────────────────────────────────────
-function SubjectCard({ p, selected, onClick }) {
-  const color  = TIER_COLOR[p.score.tier];
-  const pcolor = pColor(p.party);
-  const [hov,  setHov]   = useState(false);
-  const [imgErr, setImgErr] = useState(false);
-  const photo = proxyPhoto(p.photo);
+// ─── RADIAL EVIDENCE DIAGRAM (Canvas-drawn) ───────────────────────────────────
+function RadialDiagram({ politician, width, height }) {
+  const canvasRef = useRef(null);
+  const animRef   = useRef(null);
+  const phaseRef  = useRef(0);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !politician) return;
+    const ctx    = canvas.getContext("2d");
+    const W = width, H = height;
+    const cx = W * 0.38, cy = H * 0.5;
+    const p  = politician;
+    const sc = p._score;
+
+    // Build radial segments from data
+    const segments = [];
+
+    // Wealth arc (bottom-left)
+    const wYrs = Object.keys(p.totalAssets || {}).sort();
+    if (wYrs.length >= 2) {
+      wYrs.forEach((yr, i) => {
+        const val = p.totalAssets[yr];
+        const maxVal = Math.max(...Object.values(p.totalAssets));
+        segments.push({ label: yr, value: val/maxVal, type:"wealth", color:"#ffb340", angle: -Math.PI*0.9 + i*(Math.PI*0.35) });
+      });
+    }
+
+    // Cases (top-right)
+    (p.criminalCases || []).forEach((c, i) => {
+      const color = c.status==="PENDING"?"#ff453a":c.status==="DROPPED"?"#ff9f0a":"#32d74b";
+      segments.push({ label: c.case.slice(0,20), value: 0.6 + (i*0.08), type:"case", color, angle: Math.PI*0.05 + i*(Math.PI*0.22) });
+    });
+
+    // Network (right)
+    (p.network || []).forEach((n, i) => {
+      const risk = (n.tradeBeforePolicy?0.4:0) + (n.govtContractWon?0.5:0) + (n.holdingsInConflictSectors?0.3:0);
+      segments.push({ label: n.name.split(" ")[0], value: Math.min(risk, 1), type:"network", color:"#c77dff", angle: -Math.PI*0.25 + i*(Math.PI*0.28) });
+    });
+
+    // Party history (bottom)
+    (p.partyHistory || []).forEach((ph, i) => {
+      segments.push({ label: ph.party, value: 0.45, type:"party", color: pColor(ph.party), angle: Math.PI*0.55 + i*(Math.PI*0.25) });
+    });
+
+    const draw = () => {
+      ctx.clearRect(0, 0, W, H);
+      phaseRef.current += 0.008;
+      const phase = phaseRef.current;
+
+      // Background subtle grid
+      ctx.strokeStyle = "rgba(255,179,64,0.04)";
+      ctx.lineWidth = 1;
+      for (let r = 40; r < Math.max(W,H); r += 60) {
+        ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.stroke();
+      }
+
+      // Center pulse rings
+      const pulseR = 24 + Math.sin(phase*2)*4;
+      const grad = ctx.createRadialGradient(cx,cy,0,cx,cy,pulseR*2);
+      grad.addColorStop(0, TIER_STYLE[sc.tier].glow.replace("0.25","0.6"));
+      grad.addColorStop(1, "transparent");
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(cx,cy,pulseR*2,0,Math.PI*2); ctx.fill();
+
+      ctx.strokeStyle = TIER_STYLE[sc.tier].color;
+      ctx.lineWidth = 2;
+      ctx.shadowColor = TIER_STYLE[sc.tier].color;
+      ctx.shadowBlur  = 12;
+      ctx.beginPath(); ctx.arc(cx,cy,pulseR,0,Math.PI*2); ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // Score number at center
+      ctx.fillStyle = TIER_STYLE[sc.tier].color;
+      ctx.font = `700 ${Math.round(pulseR*1.1)}px 'IBM Plex Mono', monospace`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.shadowColor = TIER_STYLE[sc.tier].color;
+      ctx.shadowBlur  = 20;
+      ctx.fillText(sc.final, cx, cy);
+      ctx.shadowBlur = 0;
+
+      // Radial arms
+      segments.forEach((seg, i) => {
+        const angle     = seg.angle + Math.sin(phase + i*0.5)*0.025; // gentle breathing
+        const baseR     = 55;
+        const maxR      = Math.min(W, H) * 0.38;
+        const armLen    = baseR + seg.value * (maxR - baseR);
+        const wobble    = Math.sin(phase*1.3 + i*1.1) * 3;
+        const ex        = cx + Math.cos(angle) * (armLen + wobble);
+        const ey        = cy + Math.sin(angle) * (armLen + wobble);
+        const mx        = cx + Math.cos(angle) * (armLen*0.5);
+        const my        = cy + Math.sin(angle) * (armLen*0.5);
+        const cpx       = mx + Math.cos(angle + Math.PI/2) * (armLen*0.15);
+        const cpy       = my + Math.sin(angle + Math.PI/2) * (armLen*0.15);
+
+        // Arm line (curved)
+        const alpha = 0.35 + seg.value * 0.4 + Math.sin(phase + i)*0.1;
+        ctx.strokeStyle = seg.color + Math.round(alpha*255).toString(16).padStart(2,"0");
+        ctx.lineWidth   = 1.2 + seg.value;
+        ctx.shadowColor = seg.color;
+        ctx.shadowBlur  = seg.type==="case"?8:4;
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(angle)*baseR, cy + Math.sin(angle)*baseR);
+        ctx.quadraticCurveTo(cpx,cpy,ex,ey);
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+
+        // End node
+        const nodeR = 3.5 + seg.value * 5 + Math.sin(phase*1.8+i)*1.2;
+        ctx.fillStyle = seg.color + "cc";
+        ctx.shadowColor = seg.color;
+        ctx.shadowBlur  = 10;
+        ctx.beginPath(); ctx.arc(ex,ey,nodeR,0,Math.PI*2); ctx.fill();
+        ctx.shadowBlur = 0;
+
+        // Label
+        const labelDist = armLen + nodeR + 14;
+        const lx = cx + Math.cos(angle) * labelDist;
+        const ly = cy + Math.sin(angle) * labelDist;
+        ctx.fillStyle = seg.color + "bb";
+        ctx.font = `10px 'IBM Plex Mono', monospace`;
+        ctx.textAlign = Math.cos(angle) > 0 ? "left" : "right";
+        ctx.textBaseline = "middle";
+        ctx.fillText(seg.label, lx, ly);
+      });
+
+      // Connection threads between related segments
+      for (let i = 0; i < segments.length; i++) {
+        for (let j = i+1; j < segments.length; j++) {
+          const a = segments[i], b = segments[j];
+          if (a.type === b.type && a.type === "case") {
+            const aR = 55 + a.value*(Math.min(W,H)*0.38-55);
+            const bR = 55 + b.value*(Math.min(W,H)*0.38-55);
+            const ax = cx + Math.cos(a.angle)*aR, ay = cy + Math.sin(a.angle)*aR;
+            const bx = cx + Math.cos(b.angle)*bR, by = cy + Math.sin(b.angle)*bR;
+            ctx.strokeStyle = "rgba(255,69,58,0.08)";
+            ctx.lineWidth = 0.5;
+            ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(bx,by); ctx.stroke();
+          }
+        }
+      }
+
+      // Right panel: stats flowing out
+      const statX = cx + Math.min(W,H)*0.48;
+      const stats = [
+        { label:"NET WORTH",   value:`₹${sc.netWorth}Cr`,          color: sc.netWorth>50?"#ff453a":AMBER },
+        { label:"UNEXPLAINED", value:`₹${sc.unexplained.toFixed(1)}Cr`, color: sc.unexplained>20?"#ff453a":MID },
+        { label:"PENDING",     value:`${sc.pendingCases} cases`,    color: sc.pendingCases>2?"#ff453a":sc.pendingCases>0?"#ff9f0a":"#32d74b" },
+        { label:"PARTY HIST.", value:`${(p.partyHistory||[]).length} parties`, color: (p.partyHistory||[]).length>2?"#ff9f0a":MID },
+      ];
+      stats.forEach((s, i) => {
+        const y = cy - 44 + i * 30;
+        ctx.fillStyle = "rgba(15,9,0,0.7)";
+        ctx.fillRect(statX - 4, y - 10, 175, 24);
+        ctx.fillStyle = s.color + "33";
+        ctx.fillRect(statX - 4, y - 10, 4, 24);
+        ctx.fillStyle = DIM;
+        ctx.font = "8px 'IBM Plex Mono', monospace";
+        ctx.textAlign = "left";
+        ctx.fillText(s.label, statX + 6, y - 1);
+        ctx.fillStyle = s.color;
+        ctx.font = "700 12px 'IBM Plex Mono', monospace";
+        ctx.fillText(s.value, statX + 6, y + 11);
+      });
+
+      animRef.current = requestAnimationFrame(draw);
+    };
+
+    draw();
+    return () => cancelAnimationFrame(animRef.current);
+  }, [politician, width, height]);
+
+  return <canvas ref={canvasRef} width={width} height={height} style={{ display:"block" }}/>;
+}
+
+// ─── SIGNAL LINE (waveform per politician in the list) ────────────────────────
+function SignalLine({ p, selected, onClick, flashLevel }) {
+  const sc     = p._score;
+  const ts     = TIER_STYLE[sc.tier];
+  const pc     = pColor(p.party);
+  const wavePath = useMemo(() => generateWaveform(sc.final, parseInt(p.id||"1")), [sc.final, p.id]);
+  const [hovered, setHovered] = useState(false);
+
+  const isLit = flashLevel > 0 || selected || hovered;
 
   return (
-    <div onClick={onClick} onMouseEnter={()=>setHov(true)} onMouseLeave={()=>setHov(false)}
-      style={{ position:"relative", padding:"12px 14px", cursor:"pointer", marginBottom:1,
-        background: selected ? "#0F0F0F" : hov ? "#080808" : "transparent",
-        borderLeft:`2px solid ${selected ? color : "transparent"}`,
-        transition:"all 0.15s", overflow:"hidden" }}>
+    <div
+      onClick={onClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        padding:"10px 16px 10px 20px",
+        cursor:"pointer",
+        position:"relative",
+        transition:"background 0.3s",
+        background: selected ? "rgba(255,179,64,0.06)" : hovered ? "rgba(255,179,64,0.03)" : "transparent",
+        borderBottom: `1px solid rgba(255,179,64,0.04)`,
+        borderLeft: `2px solid ${selected ? ts.color : flashLevel>0 ? ts.color+"aa" : "transparent"}`,
+      }}
+    >
+      {/* Flash overlay */}
+      {flashLevel > 0 && (
+        <div style={{
+          position:"absolute", inset:0, pointerEvents:"none",
+          background:`linear-gradient(90deg, ${ts.glow} 0%, transparent 70%)`,
+          animation:"nw-flash 2s ease-out forwards",
+        }}/>
+      )}
 
-      {/* Glow on selected */}
-      {selected && <div style={{ position:"absolute", left:0, top:0, bottom:0, width:60,
-        background:`linear-gradient(to right, ${color}08, transparent)`, pointerEvents:"none" }}/>}
-
-      <div style={{ display:"flex", gap:10, alignItems:"center", position:"relative" }}>
-        {/* Photo or initials */}
-        <div style={{ width:36, height:36, borderRadius:3, flexShrink:0, overflow:"hidden",
-          border:`1px solid #1E1E1E`, filter:"grayscale(100%) contrast(1.1)",
-          background:"#111", position:"relative" }}>
-          {photo && !imgErr
-            ? <img src={photo} alt={p.name} onError={()=>setImgErr(true)}
-                style={{width:"100%",height:"100%",objectFit:"cover"}}/>
-            : <div style={{width:"100%",height:"100%",display:"flex",alignItems:"center",
-                justifyContent:"center",fontFamily:"'Bebas Neue',cursive",
-                fontSize:14,color:"#333",letterSpacing:1}}>
-                {p.name.split(" ").map(w=>w[0]).join("").slice(0,2)}
-              </div>}
+      <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+        {/* Name + party */}
+        <div style={{ width:170, flexShrink:0 }}>
+          <div style={{
+            fontSize:12.5, fontWeight:600, color: isLit ? "#f5d9a0" : "#9a7040",
+            fontFamily:"'DM Serif Display', serif",
+            letterSpacing:.2, lineHeight:1.2,
+            transition:"color .3s",
+            whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+          }}>{p.name}</div>
+          <div style={{ display:"flex", gap:5, marginTop:3, alignItems:"center" }}>
+            <span style={{ fontSize:8, fontWeight:700, color:pc, letterSpacing:1.5,
+              fontFamily:"'IBM Plex Mono', monospace", opacity:.9 }}>{p.party}</span>
+            {p.chamber==="RS" && <span style={{ fontSize:7, color:DIM, fontFamily:"'IBM Plex Mono', monospace", letterSpacing:1 }}>RS</span>}
+            {sc.pendingCases > 0 && (
+              <span style={{ fontSize:7, color:TIER_STYLE.CRITICAL.color, fontFamily:"'IBM Plex Mono', monospace",
+                animation:"nw-blink 1.4s infinite", letterSpacing:1 }}>
+                ⬤ {sc.pendingCases}
+              </span>
+            )}
+          </div>
         </div>
 
-        <div style={{ flex:1, minWidth:0 }}>
-          <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:11, fontWeight:600,
-            color: selected ? "#FFF" : "#888", overflow:"hidden", textOverflow:"ellipsis",
-            whiteSpace:"nowrap", letterSpacing:-0.3 }}>
-            {p.name.toUpperCase()}
-          </div>
-          <div style={{ display:"flex", gap:6, marginTop:3, alignItems:"center" }}>
-            <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9,
-              color:pcolor, fontWeight:600, letterSpacing:1 }}>{p.party}</span>
-            <span style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, color:"#333" }}>
-              {p.criminalCases?.length > 0 ? `${p.criminalCases.length}⚖` : ""}
-            </span>
-          </div>
+        {/* Signal waveform */}
+        <div style={{ flex:1, position:"relative", height:32, overflow:"hidden" }}>
+          <svg width="100%" height="32" preserveAspectRatio="none" viewBox={`0 0 200 32`}>
+            <defs>
+              <linearGradient id={`wg${p.id}`} x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stopColor={ts.color} stopOpacity="0"/>
+                <stop offset="30%" stopColor={ts.color} stopOpacity={isLit?"0.9":"0.25"}/>
+                <stop offset="100%" stopColor={ts.color} stopOpacity={isLit?"0.5":"0.1"}/>
+              </linearGradient>
+              <filter id={`wf${p.id}`}><feGaussianBlur stdDeviation="0.8"/></filter>
+            </defs>
+            {/* Glow duplicate */}
+            {isLit && <path d={wavePath} stroke={ts.color} strokeWidth="3" fill="none" opacity="0.15" filter={`url(#wf${p.id})`}/>}
+            <path d={wavePath} stroke={`url(#wg${p.id})`} strokeWidth={selected?1.8:1.2} fill="none"/>
+          </svg>
         </div>
 
         {/* Score */}
-        <div style={{ fontFamily:"'JetBrains Mono',monospace", fontWeight:800, fontSize:16,
-          color, textShadow:`0 0 8px ${color}66`, letterSpacing:-1, minWidth:28, textAlign:"right" }}>
-          {p.score.final}
+        <div style={{ width:38, textAlign:"right", flexShrink:0 }}>
+          <div style={{
+            fontSize:18, fontWeight:700, color: ts.color,
+            fontFamily:"'IBM Plex Mono', monospace",
+            lineHeight:1, letterSpacing:-1,
+            textShadow: isLit ? `0 0 16px ${ts.color}` : "none",
+            transition:"text-shadow .3s",
+          }}>{sc.final}</div>
         </div>
-      </div>
-
-      {/* Score bar */}
-      <div style={{ height:1, background:"#111", marginTop:8, borderRadius:1, overflow:"hidden" }}>
-        <div style={{ width:`${p.score.final}%`, height:"100%", background:color, borderRadius:1,
-          opacity: selected ? 1 : 0.4 }}/>
       </div>
     </div>
   );
 }
 
-// ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
-export default function NetaWatchClient({ initialData }) {
-  useFonts();
-  const [selId,  setSelId]  = useState(initialData[0]?.id);
-  const [search, setSearch] = useState("");
-  const [sortBy, setSortBy] = useState("score");
-  const [tab,    setTab]    = useState("brief");
-  const [ticker, setTicker] = useState(0);
+// ─── TIMELINE STRIP ───────────────────────────────────────────────────────────
+function TimelineStrip({ events }) {
+  if (!events?.length) return null;
+  const typeColor = { party:"#c77dff", legal:"#ff453a", appt:"#4a9eff",
+    trade:"#ff9f0a", policy:"#5a3e1b", gain:"#32d74b", contract:"#ff453a" };
+  return (
+    <div style={{ position:"relative", overflowX:"auto", paddingBottom:4 }}>
+      <div style={{ display:"flex", gap:0, minWidth:"max-content", position:"relative" }}>
+        {/* Connecting line */}
+        <div style={{ position:"absolute", top:12, left:8, right:8, height:1,
+          background:"linear-gradient(to right, transparent, rgba(255,179,64,0.15), transparent)" }}/>
+        {events.map((ev, i) => {
+          const c = typeColor[ev.type] || DIM;
+          return (
+            <div key={i} style={{ display:"flex", flexDirection:"column", alignItems:"center",
+              gap:6, padding:"0 10px", cursor:"default", position:"relative" }}>
+              <div style={{
+                width:10, height:10, borderRadius:"50%", flexShrink:0, zIndex:1,
+                background: ev.flag ? c : "transparent",
+                border:`1.5px solid ${c}`,
+                boxShadow: ev.flag ? `0 0 8px ${c}` : "none",
+              }}/>
+              <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:2 }}>
+                <span style={{ fontSize:8, color:DIM, fontFamily:"'IBM Plex Mono', monospace",
+                  letterSpacing:.5, whiteSpace:"nowrap" }}>{ev.date}</span>
+                <span style={{ fontSize:9, color: ev.flag ? "#f5d9a0" : "#5a3e1b",
+                  fontFamily:"'DM Serif Display', serif", maxWidth:90,
+                  textAlign:"center", lineHeight:1.3 }}>{ev.event}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
-  // Ticker
-  useEffect(() => { const t = setInterval(() => setTicker(n => n+1), 40); return () => clearInterval(t); }, []);
+// ─── LIVE NEWS FEED ───────────────────────────────────────────────────────────
+function LiveNews({ newsItems }) {
+  if (!newsItems?.length) return (
+    <div style={{ padding:"12px 0", fontFamily:"'IBM Plex Mono', monospace",
+      fontSize:9, color:DIM, letterSpacing:1 }}>AWAITING SIGNAL…</div>
+  );
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+      {newsItems.map((n, i) => (
+        <a key={i} href={n.link} target="_blank" rel="noreferrer"
+          style={{ textDecoration:"none", display:"block", padding:"9px 11px",
+            background: n.isCourt ? "rgba(255,69,58,0.06)" : "rgba(255,179,64,0.04)",
+            borderLeft:`2px solid ${n.isCourt?"#ff453a":AMBER+"44"}`,
+            borderRadius:"0 4px 4px 0",
+          }}>
+          <div style={{ fontSize:11, color: n.isCourt ? "#ffb8b0" : "#c4a060",
+            fontFamily:"'DM Serif Display', serif", lineHeight:1.45, marginBottom:3 }}>
+            {n.isCourt && <span style={{ color:"#ff453a", fontSize:8,
+              fontFamily:"'IBM Plex Mono', monospace", letterSpacing:1, marginRight:5 }}>COURT</span>}
+            {n.title}
+          </div>
+          <div style={{ fontSize:8, color:DIM, fontFamily:"'IBM Plex Mono', monospace", letterSpacing:.5 }}>
+            {n.src} · {n.date}
+          </div>
+        </a>
+      ))}
+    </div>
+  );
+}
+
+// ─── MAIN ─────────────────────────────────────────────────────────────────────
+export default function NetaWatchClient({ initialData }) {
+  // Font injection
+  useEffect(() => {
+    if (document.getElementById("nw-fonts")) return;
+    const l = document.createElement("link");
+    l.id = "nw-fonts"; l.rel = "stylesheet";
+    l.href = "https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=IBM+Plex+Mono:wght@400;600;700&display=swap";
+    document.head.appendChild(l);
+  }, []);
+
+  const [pols,      setPols]     = useState(initialData);
+  const [selected,  setSelected] = useState(initialData[0]?.id || null);
+  const [query,     setQuery]    = useState("");
+  const [sortBy,    setSortBy]   = useState("score");
+  const [connected, setConn]     = useState(false);
+  const [flashes,   setFlashes]  = useState({}); // id -> flash intensity
+  const [newsMap,   setNewsMap]  = useState({}); // id -> news[]
+  const [liveCount, setLC]       = useState(0);
+  const [diagSize,  setDiagSize] = useState({ w:0, h:0 });
+  const rightRef = useRef(null);
+  const [clock, setClock] = useState("");
+
+  useEffect(() => {
+    const tick = () => setClock(new Date().toLocaleTimeString("en-IN",{hour12:false}));
+    tick(); const t = setInterval(tick, 1000); return () => clearInterval(t);
+  }, []);
+
+  // Measure right panel for canvas
+  useEffect(() => {
+    if (!rightRef.current) return;
+    const ro = new ResizeObserver(entries => {
+      const e = entries[0];
+      setDiagSize({ w: Math.round(e.contentRect.width), h: Math.round(e.contentRect.height * 0.52) });
+    });
+    ro.observe(rightRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  // SSE connection
+  useEffect(() => {
+    let src;
+    const connect = () => {
+      src = new EventSource("/api/stream");
+      src.addEventListener("init", e => {
+        const d = JSON.parse(e.data);
+        setPols(d.politicians);
+        setConn(true);
+      });
+      src.addEventListener("news", e => {
+        const { id, news } = JSON.parse(e.data);
+        setNewsMap(m => ({ ...m, [id]: news }));
+        setFlashes(f => ({ ...f, [id]: Date.now() }));
+        setLC(n => n + 1);
+      });
+      src.addEventListener("heartbeat", () => setConn(true));
+      src.onerror = () => { setConn(false); src.close(); setTimeout(connect, 5000); };
+    };
+    connect();
+    return () => src?.close();
+  }, []);
 
   const sorted = useMemo(() => {
-    const arr = [...initialData];
-    if (sortBy === "score")  return arr.sort((a,b) => b.score.final - a.score.final);
-    if (sortBy === "assets") return arr.sort((a,b) => (Object.values(b.totalAssets||{}).pop()||0)-(Object.values(a.totalAssets||{}).pop()||0));
-    if (sortBy === "cases")  return arr.sort((a,b) => (b.criminalCases?.length||0)-(a.criminalCases?.length||0));
-    return arr.sort((a,b) => a.name.localeCompare(b.name));
-  }, [initialData, sortBy]);
+    const arr = [...pols];
+    if (sortBy==="score")  arr.sort((a,b)=>b._score.final-a._score.final);
+    if (sortBy==="wealth") arr.sort((a,b)=>(b._score?.netWorth||0)-(a._score?.netWorth||0));
+    if (sortBy==="cases")  arr.sort((a,b)=>(b._score?.pendingCases||0)-(a._score?.pendingCases||0));
+    if (sortBy==="name")   arr.sort((a,b)=>a.name.localeCompare(b.name));
+    return arr;
+  }, [pols, sortBy]);
 
-  const filtered = useMemo(() =>
-    sorted.filter(p => `${p.name} ${p.party} ${p.state} ${p.constituency}`.toLowerCase().includes(search.toLowerCase()))
-  , [sorted, search]);
+  const filtered = useMemo(() => {
+    if (!query) return sorted;
+    const q = query.toLowerCase();
+    return sorted.filter(p => `${p.name} ${p.party} ${p.state} ${p.constituency}`.toLowerCase().includes(q));
+  }, [sorted, query]);
 
-  const sel    = initialData.find(p => p.id === selId) || initialData[0];
-  const S      = sel.score;
-  const color  = TIER_COLOR[S.tier];
-  const pcolor = pColor(sel.party);
+  const selPol = pols.find(p => p.id === selected) || pols[0];
+  const selNews = selPol ? (newsMap[selPol.id] || selPol._liveNews || []) : [];
+  const selScore = selPol?._score;
+  const selTier  = selScore ? TIER_STYLE[selScore.tier] : TIER_STYLE.CLEAR;
 
-  const netWorth  = Object.values(sel.totalAssets || {}).pop() || 0;
-  const assetYrs  = Object.keys(sel.totalAssets || {}).sort();
-  const growth    = assetYrs.length >= 2
-    ? ((netWorth - sel.totalAssets[assetYrs[0]]) / (sel.totalAssets[assetYrs[0]] || 1) * 100).toFixed(0)
-    : null;
+  // Stats
+  const stats = useMemo(() => ({
+    total:    pols.length,
+    critical: pols.filter(p=>p._score?.tier==="CRITICAL").length,
+    cases:    pols.reduce((s,p)=>s+(p._score?.pendingCases||0),0),
+    wealth:   Math.round(pols.reduce((s,p)=>s+(p._score?.netWorth||0),0)),
+  }), [pols]);
 
-  const DIMS = [
-    { key:"wealth",     label:"WEALTH GAP"  },
-    { key:"cases",      label:"CASES"        },
-    { key:"network",    label:"NETWORK"      },
-    { key:"disclosure", label:"DISCLOSURE"   },
-    { key:"timing",     label:"TIMING"       },
-    { key:"conflict",   label:"CONFLICT"     },
-  ];
-
-  // Ticker text
-  const tickerText = sorted.slice(0,15).map(p => `${p.name.toUpperCase()} [${p.party}] ▸ ₹${Object.values(p.totalAssets||{}).pop()||0}CR ▸ INDEX:${p.score.final}`).join("   ///   ");
-  const doubled    = tickerText + "   ///   " + tickerText;
-  const tickX      = -(ticker % (tickerText.length * 7.8));
-
-  const totalCases = useMemo(() => initialData.reduce((s,p) => s+(p.criminalCases?.length||0),0), [initialData]);
-  const critical   = useMemo(() => initialData.filter(p => p.score.tier === "CRITICAL").length, [initialData]);
-
-  const TABS = [["brief","BRIEF"],["evidence","EVIDENCE"],["assets","ASSETS"],["network","NETWORK"],["cases","CASES"],["party","PARTY"]];
-
-  const [imgErr, setImgErr] = useState(false);
-  useEffect(() => setImgErr(false), [selId]);
-  const photo = proxyPhoto(sel.photo);
+  // Ticker
+  const [tickX, setTickX] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTickX(x => x - 1), 28);
+    return () => clearInterval(t);
+  }, []);
+  const tickText = sorted.slice(0,12).map(p=>`${p.name}  ${p._score?.final||0}`).join("  ·  ") + "  ·  ";
 
   return (
-    <div style={{ fontFamily:"'Crimson Pro',serif", background:"#050505", minHeight:"100vh",
-      color:"#888", fontSize:14, lineHeight:1.6, overflowX:"hidden" }}>
-
-      <ScanEffect/>
+    <div style={{ display:"flex", flexDirection:"column", height:"100vh", overflow:"hidden",
+      background:BG, color:AMBER, fontFamily:"'IBM Plex Mono', monospace",
+      // Noise texture overlay
+      backgroundImage:`url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E")`,
+    }}>
 
       <style>{`
-        @keyframes fadeout { to { opacity:0; pointer-events:none; } }
-        @keyframes scandown { from { background-position:0 0; } to { background-position:0 100vh; } }
-        @keyframes pulse-red { 0%,100%{box-shadow:0 0 6px #FF1A1A} 50%{box-shadow:0 0 20px #FF1A1A} }
-        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
-        @keyframes slidein { from{opacity:0;transform:translateX(8px)} to{opacity:1;transform:none} }
-        @keyframes stamp { 0%{transform:scale(2) rotate(-8deg);opacity:0} 60%{transform:scale(0.95) rotate(-3deg)} 100%{transform:scale(1) rotate(-3deg);opacity:1} }
-        ::-webkit-scrollbar { width:3px; } ::-webkit-scrollbar-track { background:#0A0A0A; }
-        ::-webkit-scrollbar-thumb { background:#1E1E1E; }
+        @keyframes nw-flash  { 0%{opacity:1} 100%{opacity:0} }
+        @keyframes nw-blink  { 0%,100%{opacity:1} 50%{opacity:0.15} }
+        @keyframes nw-pulse  { 0%,100%{transform:scale(1)} 50%{transform:scale(1.15)} }
+        @keyframes nw-slidein{ from{opacity:0;transform:translateX(12px)} to{opacity:1;transform:none} }
+        @keyframes nw-fadein { from{opacity:0} to{opacity:1} }
         * { box-sizing:border-box; margin:0; padding:0; }
-        .section-header { font-family:'Bebas Neue',cursive; font-size:11px; letter-spacing:4px;
-          color:#222; text-transform:uppercase; margin-bottom:14px; padding-bottom:6px;
-          border-bottom:1px solid #111; }
-        .tab-btn { background:none; border:none; font-family:'JetBrains Mono',monospace;
-          font-size:10px; font-weight:600; letter-spacing:2px; color:#333; cursor:pointer;
-          padding:10px 14px; border-bottom:1px solid transparent; transition:all 0.15s; white-space:nowrap; }
-        .tab-btn:hover { color:#888; }
-        .tab-btn.active { color:#CCC; border-bottom-color:#FF1A1A; }
-        .sort-btn { background:none; border:1px solid #1A1A1A; border-radius:2px;
-          font-family:'JetBrains Mono',monospace; font-size:9px; letter-spacing:1px;
-          color:#333; cursor:pointer; padding:3px 8px; transition:all 0.1s; }
-        .sort-btn.active { background:#FF1A1A; color:#FFF; border-color:#FF1A1A; }
-        .sort-btn:hover { border-color:#333; color:#888; }
-        .dossier-in { animation:slidein 0.2s ease; }
-        .stat-box { background:#0A0A0A; border:1px solid #111; padding:12px; text-align:center; }
-        .mono { font-family:'JetBrains Mono',monospace; }
-        .bebas { font-family:'Bebas Neue',cursive; }
+        ::-webkit-scrollbar { width:3px; background:transparent; }
+        ::-webkit-scrollbar-thumb { background:rgba(255,179,64,0.12); border-radius:2px; }
+        input::placeholder { color:${DIM}; }
         a { color:inherit; text-decoration:none; }
+        .nw-sort { background:none; border:1px solid ${DIM}44; border-radius:3px; padding:3px 8px;
+          font-family:'IBM Plex Mono',monospace; font-size:9px; color:${DIM}; cursor:pointer;
+          letter-spacing:1px; transition:all .15s; }
+        .nw-sort:hover { border-color:${AMBER}44; color:${AMBER}88; }
+        .nw-sort.on { border-color:${AMBER}66; color:${AMBER}; background:rgba(255,179,64,0.08); }
       `}</style>
 
-      {/* ── TOPBAR ── */}
-      <div style={{ height:42, background:"#000", borderBottom:"1px solid #111", display:"flex",
-        alignItems:"center", padding:"0 20px", gap:16, position:"sticky", top:0, zIndex:100 }}>
-        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-          <div style={{ width:6, height:6, borderRadius:"50%", background:"#FF1A1A",
-            animation:"pulse-red 2s infinite" }}/>
-          <span className="bebas" style={{ fontSize:18, letterSpacing:3, color:"#FFF" }}>NETA</span>
-          <span className="bebas" style={{ fontSize:18, letterSpacing:3, color:"#FF1A1A" }}>WATCH</span>
-        </div>
-        <div style={{ width:1, height:20, background:"#111" }}/>
-        <div className="mono" style={{ fontSize:9, color:"#333", letterSpacing:2 }}>
-          INDIA POLITICAL INTELLIGENCE SYSTEM
-        </div>
-        <div style={{ flex:1, overflow:"hidden", position:"relative" }}>
-          <div style={{ position:"absolute", inset:0, background:"linear-gradient(to right, #000 0%, transparent 60px, transparent calc(100% - 60px), #000 100%)", zIndex:1, pointerEvents:"none" }}/>
-          <div className="mono" style={{ position:"absolute", top:"50%", transform:"translateY(-50%)",
-            fontSize:9, color:"#222", whiteSpace:"nowrap", left:tickX, letterSpacing:1 }}>{doubled}</div>
-        </div>
-        <div style={{ display:"flex", gap:8, alignItems:"center", flexShrink:0 }}>
-          <div style={{ display:"flex", gap:5, alignItems:"center", border:"1px solid #FF1A1A22",
-            padding:"3px 8px", borderRadius:2 }}>
-            <div style={{ width:4, height:4, borderRadius:"50%", background:"#FF1A1A",
-              animation:"pulse-red 1s infinite" }}/>
-            <span className="mono" style={{ fontSize:8, color:"#FF1A1A44", letterSpacing:2 }}>LIVE</span>
-          </div>
-          <span className="mono" style={{ fontSize:9, color:"#222" }}>{initialData.length} SUBJECTS</span>
-          <span className="mono" style={{ fontSize:9, color:"#FF1A1A44" }}>{totalCases} CASES</span>
-          <span className="mono" style={{ fontSize:9, color:"#FF1A1A" }}>{critical} CRITICAL</span>
+      {/* ── TICKER ── */}
+      <div style={{ height:18, overflow:"hidden", background:"rgba(0,0,0,0.4)",
+        borderBottom:`1px solid rgba(255,179,64,0.06)`, position:"relative", flexShrink:0 }}>
+        <div style={{ position:"absolute", inset:0,
+          backgroundImage:"repeating-linear-gradient(90deg,rgba(255,179,64,0.03) 0,rgba(255,179,64,0.03) 1px,transparent 1px,transparent 60px)",
+          pointerEvents:"none" }}/>
+        <div style={{ position:"absolute", left:0, top:0, bottom:0, width:40,
+          background:`linear-gradient(to right, ${BG}, transparent)`, zIndex:1, pointerEvents:"none" }}/>
+        <div style={{ position:"absolute", right:0, top:0, bottom:0, width:40,
+          background:`linear-gradient(to left, ${BG}, transparent)`, zIndex:1, pointerEvents:"none" }}/>
+        <div style={{ position:"absolute", top:"50%", transform:"translateY(-50%)",
+          left:tickX % (tickText.length * 7.5), whiteSpace:"nowrap",
+          fontSize:9, color:DIM, letterSpacing:2, fontFamily:"'IBM Plex Mono', monospace" }}>
+          {tickText}{tickText}
         </div>
       </div>
 
-      <div style={{ display:"grid", gridTemplateColumns:"320px 1fr", height:"calc(100vh - 42px)" }}>
+      {/* ── TOP BAR ── */}
+      <div style={{ display:"flex", alignItems:"center", gap:16, padding:"0 20px",
+        height:42, borderBottom:`1px solid rgba(255,179,64,0.07)`,
+        background:"rgba(0,0,0,0.3)", flexShrink:0, backdropFilter:"blur(4px)" }}>
 
-        {/* ── LEFT: SUBJECT STACK ── */}
-        <div style={{ background:"#000", borderRight:"1px solid #111",
+        {/* Logo */}
+        <div style={{ display:"flex", alignItems:"baseline", gap:6, flexShrink:0 }}>
+          <span style={{ fontFamily:"'DM Serif Display', serif", fontSize:20, color:"#f5d9a0",
+            letterSpacing:-.5, fontStyle:"italic" }}>Neta</span>
+          <span style={{ fontFamily:"'DM Serif Display', serif", fontSize:20, color:AMBER,
+            letterSpacing:-.5 }}>Watch</span>
+          <span style={{ fontSize:8, color:DIM, letterSpacing:3, marginLeft:4 }}>INDIA</span>
+        </div>
+
+        <div style={{ width:1, height:16, background:DIM+"44", flexShrink:0 }}/>
+
+        {/* Live indicator */}
+        <div style={{ display:"flex", alignItems:"center", gap:5, flexShrink:0 }}>
+          <div style={{ width:5, height:5, borderRadius:"50%",
+            background:connected?"#32d74b":"#ff453a",
+            boxShadow:`0 0 ${connected?"8px #32d74b":"6px #ff453a"}`,
+            animation: connected ? "nw-pulse 2.5s infinite" : "nw-blink 1s infinite" }}/>
+          <span style={{ fontSize:8, color:connected?"#32d74b88":"#ff453a88", letterSpacing:2 }}>
+            {connected?"LIVE":"RECONNECTING"}
+          </span>
+          {liveCount > 0 && <span style={{ fontSize:8, color:DIM, letterSpacing:1 }}>{liveCount} UPDATES</span>}
+        </div>
+
+        {/* Search */}
+        <div style={{ flex:1, maxWidth:320, position:"relative" }}>
+          <span style={{ position:"absolute", left:9, top:"50%", transform:"translateY(-50%)",
+            fontSize:11, color:DIM, pointerEvents:"none" }}>⌕</span>
+          <input value={query} onChange={e=>setQuery(e.target.value)}
+            placeholder="search subjects…"
+            style={{ width:"100%", background:"rgba(255,179,64,0.04)", border:`1px solid ${DIM}33`,
+              borderRadius:5, padding:"5px 9px 5px 24px", fontSize:9, color:AMBER,
+              letterSpacing:.5, outline:"none", fontFamily:"'IBM Plex Mono', monospace" }}/>
+        </div>
+
+        {/* Sort */}
+        <div style={{ display:"flex", gap:4, flexShrink:0 }}>
+          {[["score","SCORE"],["wealth","WEALTH"],["cases","CASES"],["name","NAME"]].map(([k,l])=>(
+            <button key={k} className={`nw-sort ${sortBy===k?"on":""}`} onClick={()=>setSortBy(k)}>{l}</button>
+          ))}
+        </div>
+
+        {/* Stats */}
+        <div style={{ display:"flex", gap:14, flexShrink:0, alignItems:"center" }}>
+          {[
+            [stats.total,"SUBJECTS","#5a3e1b"],
+            [stats.critical,"CRITICAL","#ff453a"],
+            [stats.cases,"CASES","#ff9f0a"],
+          ].map(([v,l,c])=>(
+            <div key={l} style={{ textAlign:"center" }}>
+              <div style={{ fontSize:14, fontWeight:700, color:c, lineHeight:1, letterSpacing:-1 }}>{v}</div>
+              <div style={{ fontSize:7, color:DIM, letterSpacing:2, marginTop:1 }}>{l}</div>
+            </div>
+          ))}
+          <div style={{ fontSize:8, color:DIM+"66", letterSpacing:1, marginLeft:4 }}>{clock}</div>
+        </div>
+      </div>
+
+      {/* ── BODY: LEFT LIST + RIGHT DETAIL ── */}
+      <div style={{ flex:1, display:"flex", overflow:"hidden", minHeight:0 }}>
+
+        {/* ── LEFT: SIGNAL LIST ── */}
+        <div style={{ width:350, flexShrink:0, borderRight:`1px solid rgba(255,179,64,0.07)`,
           display:"flex", flexDirection:"column", overflow:"hidden" }}>
 
-          {/* Search terminal */}
-          <div style={{ padding:"12px 14px", borderBottom:"1px solid #111" }}>
-            <div style={{ display:"flex", alignItems:"center", gap:8,
-              border:"1px solid #1A1A1A", borderRadius:2, padding:"7px 10px",
-              background:"#080808" }}>
-              <span className="mono" style={{ fontSize:11, color:"#FF1A1A", flexShrink:0 }}>$</span>
-              <input value={search} onChange={e=>setSearch(e.target.value)}
-                placeholder="SEARCH SUBJECTS..."
-                style={{ flex:1, background:"none", border:"none", outline:"none",
-                  fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#888",
-                  letterSpacing:1 }}/>
-              {search && <span className="mono" style={{ fontSize:11, color:"#333",
-                animation:"blink 1s infinite" }}>▋</span>}
-            </div>
+          {/* Column headers */}
+          <div style={{ display:"flex", alignItems:"center", padding:"7px 20px",
+            borderBottom:`1px solid rgba(255,179,64,0.05)`,
+            background:"rgba(0,0,0,0.25)", flexShrink:0 }}>
+            <span style={{ fontSize:7, color:DIM, letterSpacing:3, flex:1 }}>SUBJECT</span>
+            <span style={{ fontSize:7, color:DIM, letterSpacing:3, width:80, textAlign:"center" }}>SIGNAL</span>
+            <span style={{ fontSize:7, color:DIM, letterSpacing:3, width:38, textAlign:"right" }}>IDX</span>
           </div>
 
-          {/* Sort controls */}
-          <div style={{ padding:"6px 14px 8px", borderBottom:"1px solid #111",
-            display:"flex", gap:4, alignItems:"center" }}>
-            <span className="mono" style={{ fontSize:8, color:"#222", letterSpacing:2, marginRight:4 }}>SORT</span>
-            {[["score","IDX"],["assets","₹"],["cases","⚖"],["name","A–Z"]].map(([k,l]) => (
-              <button key={k} className={`sort-btn ${sortBy===k?"active":""}`} onClick={() => setSortBy(k)}>{l}</button>
-            ))}
-            <span className="mono" style={{ fontSize:8, color:"#222", marginLeft:"auto" }}>
-              {filtered.length}/{initialData.length}
-            </span>
-          </div>
-
-          {/* Subject list */}
+          {/* Scrollable signal list */}
           <div style={{ flex:1, overflowY:"auto" }}>
-            {filtered.map(p => (
-              <SubjectCard key={p.id} p={p} selected={p.id===selId}
-                onClick={() => { setSelId(p.id); setTab("brief"); }}/>
+            {filtered.map((p, i) => (
+              <div key={p.id} style={{ animationDelay:`${i*0.015}s`, animation:"nw-fadein .3s ease both" }}>
+                <SignalLine
+                  p={p}
+                  selected={p.id === selected}
+                  onClick={() => setSelected(p.id)}
+                  flashLevel={flashes[p.id] && Date.now()-flashes[p.id] < 2200 ? 1 : 0}
+                />
+              </div>
             ))}
-            {filtered.length === 0 && (
-              <div className="mono" style={{ padding:"24px", color:"#222", fontSize:10,
-                textAlign:"center", letterSpacing:2 }}>NO MATCH FOUND</div>
+            {!filtered.length && (
+              <div style={{ padding:"32px 20px", textAlign:"center", fontSize:9, color:DIM, letterSpacing:2 }}>
+                NO SIGNAL FOUND
+              </div>
             )}
           </div>
 
-          {/* Footer */}
-          <div style={{ padding:"10px 14px", borderTop:"1px solid #111",
-            display:"grid", gridTemplateColumns:"1fr 1fr", gap:6 }}>
-            {[["SUBJECTS",initialData.length],["TOTAL CASES",totalCases],
-              ["CRITICAL",critical],["FLAGGED",initialData.filter(p=>p.score.final>=40).length]
-            ].map(([l,v],i) => (
-              <div key={i} className="stat-box">
-                <div className="mono" style={{ fontSize:14, fontWeight:800,
-                  color:i>=2?"#FF1A1A":"#555" }}>{v}</div>
-                <div className="mono" style={{ fontSize:8, color:"#222", letterSpacing:2, marginTop:2 }}>{l}</div>
-              </div>
-            ))}
+          {/* Bottom stats */}
+          <div style={{ padding:"10px 16px", borderTop:`1px solid rgba(255,179,64,0.06)`,
+            display:"flex", gap:16, flexShrink:0, background:"rgba(0,0,0,0.3)" }}>
+            <div style={{ fontSize:7, color:DIM, letterSpacing:1 }}>
+              {filtered.length} / {pols.length} subjects
+            </div>
+            <div style={{ fontSize:7, color:DIM, letterSpacing:1, marginLeft:"auto" }}>
+              ₹{stats.wealth}Cr total declared
+            </div>
           </div>
         </div>
 
-        {/* ── RIGHT: DOSSIER ── */}
-        <div key={selId} className="dossier-in" style={{ overflowY:"auto", background:"#050505" }}>
+        {/* ── RIGHT: DETAIL PANEL ── */}
+        {selPol && (
+          <div key={selPol.id} ref={rightRef}
+            style={{ flex:1, overflowY:"auto", display:"flex", flexDirection:"column",
+              animation:"nw-slidein .22s ease" }}>
 
-          {/* DOSSIER HEADER */}
-          <div style={{ background:"#000", borderBottom:"1px solid #111", padding:"20px 24px" }}>
-            <div style={{ display:"flex", gap:20, alignItems:"flex-start" }}>
-
-              {/* Photo — mugshot treatment */}
-              <div style={{ flexShrink:0, position:"relative" }}>
-                <div style={{ width:90, height:110, background:"#0A0A0A",
-                  border:`1px solid #1A1A1A`, overflow:"hidden", position:"relative",
-                  filter:"grayscale(100%) contrast(1.15) brightness(0.85)" }}>
-                  {photo && !imgErr
-                    ? <img src={photo} alt={sel.name} onError={()=>setImgErr(true)}
-                        style={{width:"100%",height:"100%",objectFit:"cover",objectPosition:"top"}}/>
-                    : <div style={{width:"100%",height:"100%",display:"flex",alignItems:"center",
-                        justifyContent:"center",flexDirection:"column",gap:4}}>
-                        <div className="bebas" style={{fontSize:28,color:"#1E1E1E",letterSpacing:2}}>
-                          {sel.name.split(" ").map(w=>w[0]).join("").slice(0,2)}
-                        </div>
-                        <div className="mono" style={{fontSize:8,color:"#1A1A1A",letterSpacing:1}}>NO PHOTO</div>
-                      </div>}
-                </div>
-                {/* Mugshot number */}
-                <div className="mono" style={{ fontSize:8, color:"#222", textAlign:"center",
-                  marginTop:4, letterSpacing:1 }}>ID: {sel.id?.toString().padStart(4,"0")}</div>
-              </div>
-
-              {/* Identity block */}
-              <div style={{ flex:1, minWidth:0 }}>
-                <div className="mono" style={{ fontSize:9, color:"#333", letterSpacing:3,
-                  textTransform:"uppercase", marginBottom:6 }}>CLASSIFIED · PUBLIC RECORD · ECI</div>
-                <div className="bebas" style={{ fontSize:42, color:"#FFF", letterSpacing:2,
-                  lineHeight:0.9, marginBottom:8 }}>
-                  {sel.name.toUpperCase()}
-                </div>
-                <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:8 }}>
-                  <span className="mono" style={{ fontSize:10, fontWeight:600, color:pcolor,
-                    border:`1px solid ${pcolor}33`, padding:"2px 8px", borderRadius:2,
-                    letterSpacing:2 }}>{sel.party}</span>
-                  <span className="mono" style={{ fontSize:10, color:"#333",
-                    border:"1px solid #111", padding:"2px 8px", borderRadius:2 }}>
-                    {sel.chamber === "RS" ? "RAJYA SABHA" : "LOK SABHA"}
-                  </span>
-                  {sel.criminalCases?.length > 0 && (
-                    <span className="mono" style={{ fontSize:10, color:"#FF1A1A",
-                      border:"1px solid #FF1A1A33", padding:"2px 8px", borderRadius:2,
-                      animation:"pulse-red 2s infinite", letterSpacing:1 }}>
-                      {sel.criminalCases.length} PENDING CASES
-                    </span>
-                  )}
-                </div>
-                <div className="mono" style={{ fontSize:10, color:"#333", lineHeight:2, letterSpacing:.5 }}>
-                  {[sel.constituency, sel.state, sel.role, sel.education && `EDU: ${sel.education}`]
-                    .filter(Boolean).join(" · ")}
-                </div>
-              </div>
-
-              {/* Threat meter */}
-              <div style={{ flexShrink:0, padding:"8px 16px", background:"#080808",
-                border:`1px solid ${color}22`, borderRadius:4,
-                boxShadow:`0 0 30px ${color}11, inset 0 0 20px #00000088` }}>
-                <div className="mono" style={{ fontSize:8, color:"#333", letterSpacing:3,
-                  textAlign:"center", marginBottom:8 }}>CORRUPTION INDEX</div>
-                <ThreatMeter score={S.final} tier={S.tier}/>
-              </div>
-            </div>
-
-            {/* Sub-scores strip */}
-            <div style={{ display:"grid", gridTemplateColumns:"repeat(6,1fr)", gap:6, marginTop:16 }}>
-              {DIMS.map(d => {
-                const v = S.sub[d.key];
-                const c = v>=75?"#FF1A1A":v>=55?"#FF6B00":v>=35?"#FFB800":v>=15?"#4ADE80":"#1A1A1A";
-                return (
-                  <div key={d.key} style={{ background:"#080808", border:"1px solid #111",
-                    padding:"8px 10px", textAlign:"center" }}>
-                    <div className="mono" style={{ fontSize:15, fontWeight:800, color:c,
-                      textShadow:v>40?`0 0 8px ${c}66`:undefined }}>{v}</div>
-                    <div className="mono" style={{ fontSize:7, color:"#333", letterSpacing:2,
-                      marginTop:3 }}>{d.label}</div>
-                    <div style={{ height:2, background:"#0F0F0F", borderRadius:1, marginTop:5, overflow:"hidden" }}>
-                      <div style={{ width:`${v}%`, height:"100%", background:c }}/>
-                    </div>
+            {/* Header */}
+            <div style={{ padding:"24px 28px 16px",
+              borderBottom:`1px solid rgba(255,179,64,0.06)`,
+              background:"rgba(0,0,0,0.2)", flexShrink:0 }}>
+              <div style={{ display:"flex", gap:16, alignItems:"flex-start" }}>
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontSize:8, color:DIM, letterSpacing:3, marginBottom:6, textTransform:"uppercase" }}>
+                    {selPol.chamber==="RS"?"Rajya Sabha":"Lok Sabha"} · {selPol.state}
                   </div>
-                );
-              })}
-            </div>
-
-            {/* Stamp */}
-            <div style={{ position:"relative", marginTop:12, minHeight:30 }}>
-              <div style={{ position:"absolute", right:4, top:-8,
-                fontFamily:"'Bebas Neue',cursive", fontSize:28, letterSpacing:6,
-                color:S.final >= 40 ? "#FF1A1A" : "#1A4A1A",
-                border:`3px solid ${S.final >= 40 ? "#FF1A1A" : "#1A4A1A"}`,
-                padding:"0 10px", opacity:0.7, transform:"rotate(-3deg)",
-                animation:"stamp 0.5s ease forwards",
-                boxShadow: S.final >= 40 ? "0 0 20px #FF1A1A22, inset 0 0 10px #FF1A1A11" : "none",
-              }}>
-                {S.final >= 60 ? "FLAGGED" : S.final >= 40 ? "ELEVATED RISK" : S.final >= 20 ? "MONITORING" : "CLEAR"}
-              </div>
-            </div>
-          </div>
-
-          {/* TAB BAR */}
-          <div style={{ borderBottom:"1px solid #111", display:"flex", overflow:"auto",
-            background:"#000", padding:"0 8px" }}>
-            {TABS.map(([k,l]) => (
-              <button key={k} className={`tab-btn ${tab===k?"active":""}`}
-                onClick={() => setTab(k)}>{l}</button>
-            ))}
-          </div>
-
-          {/* ── TAB CONTENT ── */}
-          <div style={{ padding:"20px 24px" }}>
-
-            {/* BRIEF */}
-            {tab==="brief" && (
-              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16 }}>
-                <div>
-                  <div className="section-header">FINANCIAL SUMMARY</div>
-                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:16 }}>
-                    {[
-                      ["NET WORTH", `₹${netWorth}CR`, color],
-                      ["GROWTH", growth ? `+${growth}%` : "SINGLE YEAR", "#4ADE80"],
-                      ["DECLARED INCOME", `₹${Object.values(sel.declaredIncome||{}).reduce((a,b)=>a+b,0).toFixed(1)}CR`, "#555"],
-                      ["UNEXPLAINED GAP", `₹${Math.max(0,netWorth-4.5).toFixed(1)}CR`,
-                        netWorth > 20 ? "#FF1A1A" : "#333"],
-                    ].map(([l,v,c],i) => (
-                      <div key={i} className="stat-box">
-                        <div className="mono" style={{ fontSize:16, fontWeight:800, color:c, letterSpacing:-1 }}>{v}</div>
-                        <div className="mono" style={{ fontSize:8, color:"#222", letterSpacing:2, marginTop:4 }}>{l}</div>
-                      </div>
-                    ))}
+                  <h1 style={{ fontFamily:"'DM Serif Display', serif", fontSize:32, color:"#f5d9a0",
+                    fontWeight:400, letterSpacing:-.5, lineHeight:1.1, marginBottom:8 }}>
+                    {selPol.name}
+                  </h1>
+                  <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+                    <span style={{ fontSize:9, fontWeight:700, color:pColor(selPol.party),
+                      letterSpacing:2, border:`1px solid ${pColor(selPol.party)}33`,
+                      padding:"2px 8px", borderRadius:3 }}>{selPol.party}</span>
+                    <span style={{ fontSize:9, color:DIM }}>{selPol.role}</span>
+                    {selPol.constituency && <span style={{ fontSize:9, color:DIM }}>{selPol.constituency}</span>}
                   </div>
-                  <AssetChart totalAssets={sel.totalAssets} liabilities={sel.liabilities}/>
                 </div>
 
-                <div>
-                  <div className="section-header">INTELLIGENCE FLAGS</div>
-                  {S.final < 20 && (
-                    <div style={{ padding:"20px", textAlign:"center", border:"1px solid #0F2A0F",
-                      borderRadius:3, background:"#050F05" }}>
-                      <div className="mono" style={{ fontSize:10, color:"#1A4A1A", letterSpacing:2 }}>
-                        NO FLAGS DETECTED
-                      </div>
-                      <div className="mono" style={{ fontSize:8, color:"#111", marginTop:6 }}>
-                        ABSENCE OF FLAGS ≠ ABSENCE OF CORRUPTION
-                      </div>
-                    </div>
-                  )}
-                  {netWorth > 20 && (
-                    <div style={{ padding:"10px 12px", marginBottom:8, background:"#0D0000",
-                      border:"1px solid #FF1A1A22", borderLeft:"3px solid #FF1A1A" }}>
-                      <div className="mono" style={{ fontSize:9, color:"#FF6B00", letterSpacing:2, marginBottom:4 }}>
-                        UNEXPLAINED WEALTH
-                      </div>
-                      <div style={{ fontFamily:"'Crimson Pro',serif", fontSize:13, color:"#888", lineHeight:1.5 }}>
-                        Declared ₹{netWorth}Cr on a public servant salary. A 30-year government career
-                        yields ~₹4.5Cr maximum. Gap of ₹{(netWorth-4.5).toFixed(1)}Cr requires explanation.
-                      </div>
-                    </div>
-                  )}
-                  {sel.criminalCases?.filter(c=>c.status==="PENDING").map((c,i) => (
-                    <div key={i} style={{ padding:"10px 12px", marginBottom:8, background:"#0D0000",
-                      border:"1px solid #FF1A1A22", borderLeft:"3px solid #FF1A1A" }}>
-                      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
-                        <div>
-                          <div className="mono" style={{ fontSize:9, color:"#FF1A1A", letterSpacing:2, marginBottom:4 }}>
-                            ● ACTIVE CASE
-                          </div>
-                          <div style={{ fontFamily:"'Crimson Pro',serif", fontSize:13, color:"#888" }}>{c.case}</div>
-                          {c.note && <div className="mono" style={{ fontSize:9, color:"#333", marginTop:4 }}>{c.note}</div>}
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                  {sel.network?.filter(n => n.govtContractWon || n.tradeBeforePolicy).map((n,i) => (
-                    <div key={i} style={{ padding:"10px 12px", marginBottom:8, background:"#0D0008",
-                      border:"1px solid #9B59B622", borderLeft:"3px solid #9B59B6" }}>
-                      <div className="mono" style={{ fontSize:9, color:"#9B59B6", letterSpacing:2, marginBottom:4 }}>
-                        NETWORK RISK · {n.type.toUpperCase()}
-                      </div>
-                      <div style={{ fontFamily:"'Crimson Pro',serif", fontSize:13, color:"#888" }}>
-                        {n.name}
-                        {n.govtContractWon && ` won ₹${n.contractValueCr}Cr govt contract`}
-                        {n.tradeBeforePolicy && ` — traded before policy announcement`}
-                      </div>
-                    </div>
-                  ))}
-
-                  {/* Party history */}
-                  {sel.partyHistory?.length > 1 && (
-                    <div style={{ marginTop:16 }}>
-                      <div className="section-header">PARTY HISTORY</div>
-                      {sel.partyHistory.map((ph, i) => (
-                        <div key={i} style={{ display:"flex", gap:10, marginBottom:8, alignItems:"center" }}>
-                          <div style={{ width:3, alignSelf:"stretch", background:pColor(ph.party),
-                            borderRadius:2, flexShrink:0 }}/>
-                          <div style={{ flex:1, background:"#080808", border:"1px solid #111",
-                            padding:"8px 12px" }}>
-                            <div className="mono" style={{ fontSize:10, fontWeight:600,
-                              color:pColor(ph.party), letterSpacing:2 }}>{ph.party}</div>
-                            <div className="mono" style={{ fontSize:9, color:"#333", marginTop:2 }}>
-                              {ph.from} – {ph.to === 2024 ? "PRESENT" : ph.to}
-                            </div>
-                          </div>
-                          {i < sel.partyHistory.length-1 && (
-                            <div className="mono" style={{ fontSize:8, color:"#222", letterSpacing:1 }}>→ SWITCH</div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                {/* Tier badge */}
+                <div style={{ textAlign:"center", flexShrink:0, padding:"12px 20px",
+                  border:`1px solid ${selTier.color}33`, borderRadius:6,
+                  background:`${selTier.glow}`, backdropFilter:"blur(4px)" }}>
+                  <div style={{ fontSize:48, fontWeight:700, color:selTier.color,
+                    fontFamily:"'IBM Plex Mono', monospace", lineHeight:1, letterSpacing:-2,
+                    textShadow:`0 0 40px ${selTier.color}` }}>{selScore.final}</div>
+                  <div style={{ fontSize:8, color:selTier.color+"aa", letterSpacing:3,
+                    marginTop:4, textTransform:"uppercase" }}>{selTier.label}</div>
+                  <div style={{ fontSize:7, color:DIM, letterSpacing:2, marginTop:2 }}>CORRUPTION INDEX</div>
                 </div>
               </div>
-            )}
 
-            {/* EVIDENCE CHAIN */}
-            {tab==="evidence" && (
-              <div>
-                <div className="section-header">CHRONOLOGICAL EVIDENCE CHAIN</div>
-                <EvidenceChain timeline={sel.timeline}/>
-                {!sel.timeline?.length && (
-                  <div style={{ marginTop:16, padding:"16px", border:"1px solid #111",
-                    borderRadius:3 }}>
-                    <div className="mono" style={{ fontSize:9, color:"#333", letterSpacing:2 }}>
-                      TIMELINE DATA NOT YET ENRICHED. RUN ENRICHMENT SCRIPT.
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* ASSETS */}
-            {tab==="assets" && (
-              <div>
-                <div className="section-header">ASSET DECLARATION ANALYSIS</div>
-                <div style={{ marginBottom:20 }}>
-                  <AssetChart totalAssets={sel.totalAssets} liabilities={sel.liabilities}/>
-                </div>
-                {sel.holdings?.length > 0 && (<>
-                  <div className="section-header" style={{ marginTop:20 }}>INVESTMENT HOLDINGS</div>
-                  {sel.holdings.map((h,i) => (
-                    <div key={i} style={{ display:"flex", gap:10, alignItems:"center",
-                      padding:"10px 12px", marginBottom:4, background:"#080808",
-                      border:`1px solid ${h.conflict?"#FF1A1A22":"#111"}`,
-                      borderLeft:`3px solid ${h.conflict?"#FF1A1A":"#1A1A1A"}` }}>
-                      <div style={{ flex:1 }}>
-                        <span className="mono" style={{ fontSize:11, color:h.conflict?"#FF1A1A":"#888",
-                          letterSpacing:1 }}>{h.sector.toUpperCase()}</span>
-                        {h.conflict && <span className="mono" style={{ fontSize:8, color:"#FF1A1A",
-                          marginLeft:8, border:"1px solid #FF1A1A33", padding:"1px 5px" }}>CONFLICT</span>}
-                      </div>
-                      <div className="mono" style={{ fontSize:13, fontWeight:800,
-                        color:h.conflict?"#FF1A1A":"#555" }}>₹{h.value}CR</div>
-                    </div>
-                  ))}
-                </>)}
-                {sel.directorships?.length > 0 && (<>
-                  <div className="section-header" style={{ marginTop:20 }}>MCA21 DIRECTORSHIPS</div>
-                  {sel.directorships.map((d,i) => (
-                    <div key={i} style={{ padding:"10px 12px", marginBottom:4, background:"#080808",
-                      border:"1px solid #111",
-                      borderLeft:`3px solid ${d.formedAfterAppt?"#FF6B00":"#1A1A1A"}` }}>
-                      <div className="mono" style={{ fontSize:10, color:"#888" }}>{d.name}</div>
-                      <div className="mono" style={{ fontSize:8, color:"#333", marginTop:3 }}>
-                        {d.cin} · {d.status} · JOINED {d.dateOfJoining||"—"}
-                        {d.formedAfterAppt && <span style={{color:"#FF6B00",marginLeft:8}}>POST-APPOINTMENT</span>}
-                      </div>
-                    </div>
-                  ))}
-                </>)}
-              </div>
-            )}
-
-            {/* NETWORK */}
-            {tab==="network" && (
-              <div>
-                <div className="section-header">NETWORK ANALYSIS</div>
-                {(!sel.network?.length) && (
-                  <div className="mono" style={{ color:"#222", fontSize:10, letterSpacing:2, padding:"20px 0" }}>
-                    NO NETWORK DATA ON FILE
-                  </div>
-                )}
-                {sel.network?.map((n,i) => {
-                  const W = { spouse:1.0,child:0.9,sibling:0.7,parent:0.6,associate:0.8,shell_company:1.0 };
-                  const prox = W[n.type]||0.5;
-                  const risk = Math.round((
-                    (n.holdingsInConflictSectors?25:0)+
-                    (n.tradeBeforePolicy?35:0)+
-                    (n.govtContractWon?30+Math.min(Math.log10(Math.max(n.contractValueCr||1,1))*5,15):0)
-                  )*prox);
+              {/* Sub-score bars */}
+              <div style={{ display:"flex", gap:12, marginTop:16, flexWrap:"wrap" }}>
+                {[
+                  ["WEALTH", selScore.wealthScore],
+                  ["CASES",  selScore.caseScore],
+                  ["NETWORK",selScore.networkScore],
+                  ["TRADES", selScore.tradeScore],
+                  ["DISCLOSE",selScore.discScore],
+                ].map(([l,v])=>{
+                  const c = v>65?"#ff453a":v>38?"#ff9f0a":v>18?"#ffd60a":"#32d74b";
                   return (
-                    <div key={i} style={{ marginBottom:12, padding:"14px 16px", background:"#080808",
-                      border:"1px solid #111",
-                      borderLeft:`3px solid ${risk>50?"#FF1A1A":risk>25?"#FF6B00":"#1A1A1A"}` }}>
-                      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
-                        <div>
-                          <div className="mono" style={{ fontSize:12, color:"#CCC", fontWeight:600 }}>{n.name}</div>
-                          <div className="mono" style={{ fontSize:9, color:"#333", marginTop:3, letterSpacing:2 }}>
-                            {n.type.replace(/_/g," ").toUpperCase()} · PROXIMITY: {Math.round(prox*100)}%
-                          </div>
-                        </div>
-                        <div style={{ textAlign:"right" }}>
-                          <div className="mono" style={{ fontSize:20, fontWeight:800,
-                            color:risk>50?"#FF1A1A":risk>25?"#FF6B00":"#555" }}>{risk}</div>
-                          <div className="mono" style={{ fontSize:7, color:"#333", letterSpacing:2 }}>RISK PTS</div>
-                        </div>
+                    <div key={l} style={{ flex:"1 1 80px" }}>
+                      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
+                        <span style={{ fontSize:7, color:DIM, letterSpacing:1.5 }}>{l}</span>
+                        <span style={{ fontSize:7, color:c, fontWeight:700 }}>{v}</span>
                       </div>
-                      <div style={{ display:"flex", gap:6, marginTop:10, flexWrap:"wrap" }}>
-                        {n.holdingsInConflictSectors && <span className="mono" style={{fontSize:8,color:"#FF6B00",
-                          border:"1px solid #FF6B0033",padding:"2px 6px"}}>CONFLICT HOLDINGS</span>}
-                        {n.tradeBeforePolicy && <span className="mono" style={{fontSize:8,color:"#FF1A1A",
-                          border:"1px solid #FF1A1A33",padding:"2px 6px"}}>INSIDER TRADE</span>}
-                        {n.govtContractWon && <span className="mono" style={{fontSize:8,color:"#FFB800",
-                          border:"1px solid #FFB80033",padding:"2px 6px"}}>
-                          GOVT CONTRACT ₹{n.contractValueCr}CR</span>}
+                      <div style={{ height:2, background:"rgba(255,179,64,0.08)", borderRadius:1, overflow:"hidden" }}>
+                        <div style={{ width:`${v}%`, height:"100%", background:c, borderRadius:1, transition:"width .7s ease" }}/>
                       </div>
-                      {n.note && <div style={{ fontFamily:"'Crimson Pro',serif", fontSize:12,
-                        color:"#444", marginTop:8, fontStyle:"italic" }}>{n.note}</div>}
                     </div>
                   );
                 })}
+              </div>
+            </div>
 
-                {sel.electoralBonds && (
-                  <div style={{ marginTop:20 }}>
-                    <div className="section-header">ELECTORAL BOND EXPOSURE</div>
-                    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:12 }}>
-                      <div className="stat-box">
-                        <div className="mono" style={{ fontSize:18, fontWeight:800,
-                          color:"#FF6B00" }}>₹{sel.electoralBonds.partyReceivedCr?.toFixed(0)||0}CR</div>
-                        <div className="mono" style={{ fontSize:8, color:"#222", letterSpacing:2 }}>PARTY RECEIVED</div>
-                      </div>
-                      <div className="stat-box" style={{borderColor:sel.electoralBonds.suspiciousDonors?.length?"#FF1A1A22":"#111"}}>
-                        <div className="mono" style={{ fontSize:18, fontWeight:800,
-                          color:sel.electoralBonds.suspiciousDonors?.length?"#FF1A1A":"#555" }}>
-                          {sel.electoralBonds.suspiciousDonors?.length||0}
-                        </div>
-                        <div className="mono" style={{ fontSize:8, color:"#222", letterSpacing:2 }}>FLAGGED DONORS</div>
-                      </div>
-                    </div>
-                    {sel.electoralBonds.topDonors?.map((d,i) => {
-                      const flagged = sel.electoralBonds.suspiciousDonors?.some(s=>s.name===d.name);
-                      return (
-                        <div key={i} style={{ padding:"8px 12px", marginBottom:4, background:"#080808",
-                          border:`1px solid ${flagged?"#FF1A1A22":"#111"}`,
-                          borderLeft:`3px solid ${flagged?"#FF1A1A":"#1A1A1A"}` }}>
-                          <div style={{ display:"flex", justifyContent:"space-between" }}>
-                            <span className="mono" style={{ fontSize:10, color:flagged?"#FF1A1A":"#888" }}>
-                              {d.name}
-                            </span>
-                            <span className="mono" style={{ fontSize:10, fontWeight:800,
-                              color:flagged?"#FF1A1A":"#555" }}>₹{d.amountCr}CR</span>
-                          </div>
-                          {flagged && <div className="mono" style={{ fontSize:8, color:"#FF1A1A44",
-                            marginTop:3, letterSpacing:2 }}>COMPANY UNDER ED/REGULATORY SCRUTINY</div>}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
+            {/* Radial diagram */}
+            {diagSize.w > 0 && (
+              <div style={{ flexShrink:0, padding:"4px 0",
+                borderBottom:`1px solid rgba(255,179,64,0.05)` }}>
+                <RadialDiagram politician={selPol} width={diagSize.w} height={Math.max(diagSize.h, 260)}/>
               </div>
             )}
 
-            {/* CASES */}
-            {tab==="cases" && (
-              <div>
-                <div className="section-header">CRIMINAL CASE REGISTER</div>
-                {(!sel.criminalCases?.length) && (
-                  <div style={{ padding:"20px", textAlign:"center", border:"1px solid #0F2A0F",
-                    background:"#050F05" }}>
-                    <div className="mono" style={{ fontSize:10, color:"#1A4A1A", letterSpacing:3 }}>
-                      NO CRIMINAL CASES ON RECORD
-                    </div>
+            {/* Content grid */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:0,
+              flex:1, minHeight:0 }}>
+
+              {/* Timeline */}
+              <div style={{ padding:"16px 20px", borderRight:`1px solid rgba(255,179,64,0.05)`,
+                borderBottom:`1px solid rgba(255,179,64,0.05)` }}>
+                <div style={{ fontSize:8, color:DIM, letterSpacing:3, marginBottom:12,
+                  textTransform:"uppercase" }}>Evidence Timeline</div>
+                {selPol.timeline?.length
+                  ? <TimelineStrip events={selPol.timeline}/>
+                  : <div style={{ fontSize:9, color:DIM+"66", fontStyle:"italic" }}>No timeline on file</div>}
+              </div>
+
+              {/* Live news */}
+              <div style={{ padding:"16px 20px", borderBottom:`1px solid rgba(255,179,64,0.05)` }}>
+                <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:12 }}>
+                  {connected && selNews.length > 0 && (
+                    <div style={{ width:5, height:5, borderRadius:"50%", background:"#32d74b",
+                      animation:"nw-pulse 2s infinite", flexShrink:0 }}/>
+                  )}
+                  <div style={{ fontSize:8, color:DIM, letterSpacing:3, textTransform:"uppercase" }}>
+                    Live Intelligence
                   </div>
-                )}
-                {sel.criminalCases?.map((c,i) => {
-                  const statusColor = c.status==="PENDING"?"#FF1A1A":c.status==="DROPPED"?"#FF6B00":"#4ADE80";
+                </div>
+                <LiveNews newsItems={selNews}/>
+              </div>
+
+              {/* Network */}
+              <div style={{ padding:"16px 20px", borderRight:`1px solid rgba(255,179,64,0.05)` }}>
+                <div style={{ fontSize:8, color:DIM, letterSpacing:3, marginBottom:12,
+                  textTransform:"uppercase" }}>Network</div>
+                {selPol.network?.length ? selPol.network.map((n,i) => {
+                  const risk = ((n.tradeBeforePolicy?38:0)+(n.govtContractWon?35:0)+(n.holdingsInConflictSectors?22:0));
+                  const c    = risk>55?"#ff453a":risk>30?"#ff9f0a":DIM;
                   return (
-                    <div key={i} style={{ marginBottom:10, padding:"14px 16px", background:"#080808",
-                      border:`1px solid ${statusColor}22`,
-                      borderLeft:`3px solid ${statusColor}` }}>
-                      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
-                        <div className="mono" style={{ fontSize:10, color:statusColor,
-                          display:"flex", alignItems:"center", gap:6 }}>
-                          {c.status==="PENDING" && <span style={{animation:"pulse-red 1s infinite"}}>●</span>}
-                          {c.status}
-                        </div>
-                        {c.resolvedYear && <div className="mono" style={{ fontSize:9, color:"#333" }}>
-                          RESOLVED {c.resolvedYear}
-                        </div>}
+                    <div key={i} style={{ marginBottom:8, padding:"8px 10px",
+                      background:"rgba(255,179,64,0.025)", borderLeft:`2px solid ${c}44`,
+                      borderRadius:"0 4px 4px 0" }}>
+                      <div style={{ fontSize:11, color:"#c4a060",
+                        fontFamily:"'DM Serif Display', serif", marginBottom:2 }}>{n.name}</div>
+                      <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                        <span style={{ fontSize:8, color:DIM, letterSpacing:1, border:`1px solid ${DIM}33`,
+                          padding:"1px 5px", borderRadius:2 }}>{n.type.replace(/_/g," ")}</span>
+                        {n.govtContractWon && <span style={{ fontSize:8, color:"#ff9f0a", letterSpacing:1 }}>
+                          ₹{n.contractValueCr}Cr contract</span>}
+                        {n.tradeBeforePolicy && <span style={{ fontSize:8, color:"#ff453a", letterSpacing:1 }}>insider trade</span>}
                       </div>
-                      <div style={{ fontFamily:"'Crimson Pro',serif", fontSize:15, color:"#CCC",
-                        fontWeight:600, marginBottom:6 }}>{c.case}</div>
-                      {c.note && <div className="mono" style={{ fontSize:9, color:"#444",
-                        borderTop:"1px solid #111", paddingTop:6, letterSpacing:.5 }}>
-                        NOTE: {c.note}
-                      </div>}
                     </div>
                   );
-                })}
-                <div style={{ marginTop:16, padding:"10px 12px", border:"1px solid #111",
-                  display:"flex", gap:10, alignItems:"center" }}>
-                  <span className="mono" style={{ fontSize:9, color:"#333" }}>VERIFY ON:</span>
-                  <a href="https://njdg.ecourts.gov.in" target="_blank" rel="noreferrer"
-                    className="mono" style={{ fontSize:9, color:"#FF1A1A44",
-                    border:"1px solid #FF1A1A22", padding:"2px 8px" }}>
-                    NJDG COURTS →
-                  </a>
-                </div>
+                }) : <div style={{ fontSize:9, color:DIM+"66" }}>—</div>}
               </div>
-            )}
 
-            {/* PARTY */}
-            {tab==="party" && (
-              <div>
-                <div className="section-header">PARTY AFFILIATION ANALYSIS</div>
-                <div style={{ marginBottom:20 }}>
-                  {sel.partyHistory?.map((ph,i) => {
-                    const c  = pColor(ph.party);
-                    const assets = Object.values(sel.totalAssets||{})[i]||0;
-                    return (
-                      <div key={i} style={{ marginBottom:8, padding:"14px 16px", background:"#080808",
-                        border:"1px solid #111",
-                        borderLeft:`3px solid ${c}` }}>
-                        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-                          <div>
-                            <div className="mono" style={{ fontSize:14, fontWeight:600,
-                              color:c, letterSpacing:2 }}>{ph.party}</div>
-                            <div className="mono" style={{ fontSize:9, color:"#333", marginTop:4 }}>
-                              {ph.from} — {ph.to===2024?"PRESENT":ph.to}
-                            </div>
-                          </div>
-                          <div style={{ textAlign:"right" }}>
-                            <div className="mono" style={{ fontSize:20, fontWeight:800,
-                              color:"#555" }}>₹{assets}CR</div>
-                            <div className="mono" style={{ fontSize:8, color:"#222", letterSpacing:2 }}>
-                              DECLARED ASSETS
-                            </div>
-                          </div>
-                        </div>
-                        {/* Check if any case dropped in this period */}
-                        {sel.criminalCases?.filter(c=>c.status==="DROPPED"&&c.resolvedYear>=ph.from&&c.resolvedYear<=ph.to).map((c,j) => (
-                          <div key={j} className="mono" style={{ fontSize:9, color:"#FF6B00",
-                            marginTop:8, borderTop:"1px solid #111", paddingTop:6 }}>
-                            ▲ CASE DROPPED DURING THIS TENURE: {c.case}
-                          </div>
-                        ))}
+              {/* Criminal cases */}
+              <div style={{ padding:"16px 20px" }}>
+                <div style={{ fontSize:8, color:DIM, letterSpacing:3, marginBottom:12,
+                  textTransform:"uppercase" }}>Criminal Cases</div>
+                {selPol.criminalCases?.length ? selPol.criminalCases.map((c,i) => {
+                  const sc = c.status==="PENDING"?"#ff453a":c.status==="DROPPED"?"#ff9f0a":"#32d74b";
+                  return (
+                    <div key={i} style={{ marginBottom:8, padding:"8px 10px",
+                      background: c.status==="PENDING"?"rgba(255,69,58,0.05)":"rgba(255,179,64,0.02)",
+                      borderLeft:`2px solid ${sc}55`, borderRadius:"0 4px 4px 0" }}>
+                      <div style={{ display:"flex", gap:6, alignItems:"center", marginBottom:3 }}>
+                        {c.status==="PENDING" && <span style={{ width:5,height:5,borderRadius:"50%",
+                          background:"#ff453a",flexShrink:0,animation:"nw-blink 1.4s infinite" }}/>}
+                        <span style={{ fontSize:8, color:sc, letterSpacing:2, fontFamily:"'IBM Plex Mono', monospace" }}>{c.status}</span>
                       </div>
-                    );
-                  })}
-                </div>
-
-                {/* Party-wide stats */}
-                <div className="section-header" style={{ marginTop:20 }}>PARTY-WIDE STATISTICS</div>
-                {(() => {
-                  const partyMap = {};
-                  initialData.forEach(p => {
-                    const party = p.party;
-                    if (!partyMap[party]) partyMap[party] = {count:0,cases:0,totalAssets:0,score:0};
-                    partyMap[party].count++;
-                    partyMap[party].cases += (p.criminalCases?.length||0);
-                    partyMap[party].totalAssets += (Object.values(p.totalAssets||{}).pop()||0);
-                    partyMap[party].score += p.score.final;
-                  });
-                  return Object.entries(partyMap)
-                    .sort((a,b)=>b[1].cases-a[1].cases).slice(0,8)
-                    .map(([party,s],i) => {
-                      const c = pColor(party);
-                      const avgScore = Math.round(s.score/s.count);
-                      return (
-                        <div key={i} style={{ display:"flex", gap:10, alignItems:"center",
-                          padding:"10px 12px", marginBottom:4, background:"#080808",
-                          border:"1px solid #111", borderLeft:`3px solid ${c}` }}>
-                          <div className="mono" style={{ fontSize:11, fontWeight:600, color:c,
-                            letterSpacing:2, width:80, flexShrink:0 }}>{party}</div>
-                          <div style={{ flex:1 }}>
-                            <div style={{ height:3, background:"#111", overflow:"hidden", borderRadius:1 }}>
-                              <div style={{ width:`${Math.min((s.cases/totalCases)*100*3,100)}%`,
-                                height:"100%", background:c }}/>
-                            </div>
-                          </div>
-                          <div className="mono" style={{ fontSize:10, color:"#FF1A1A", width:40,
-                            textAlign:"right", flexShrink:0 }}>{s.cases}</div>
-                          <div className="mono" style={{ fontSize:9, color:"#333", width:50,
-                            textAlign:"right", flexShrink:0 }}>AVG:{avgScore}</div>
-                        </div>
-                      );
-                    });
-                })()}
+                      <div style={{ fontSize:11, color:"#c4a060",
+                        fontFamily:"'DM Serif Display', serif", lineHeight:1.4 }}>{c.case}</div>
+                      {c.note && <div style={{ fontSize:8, color:DIM, marginTop:3, letterSpacing:.3 }}>{c.note}</div>}
+                    </div>
+                  );
+                }) : (
+                  <div style={{ fontSize:9, color:"#32d74b", letterSpacing:1 }}>
+                    ✓ No criminal cases on record
+                  </div>
+                )}
               </div>
-            )}
+            </div>
 
             {/* Footer */}
-            <div style={{ marginTop:32, paddingTop:16, borderTop:"1px solid #111",
-              display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-              <div className="mono" style={{ fontSize:8, color:"#1A1A1A", letterSpacing:2 }}>
-                DATA: ECI · MCA21 · NJDG · SANSAD.IN · SBI ELECTORAL BONDS
+            <div style={{ padding:"12px 20px", borderTop:`1px solid rgba(255,179,64,0.05)`,
+              display:"flex", justifyContent:"space-between", background:"rgba(0,0,0,0.2)",
+              flexShrink:0 }}>
+              <div style={{ fontSize:7, color:DIM+"66", letterSpacing:2 }}>
+                SOURCE: ECI · MYNETA · MCA21 · NJDG · SANSAD.IN
               </div>
-              <div className="mono" style={{ fontSize:8, color:"#1A1A1A", letterSpacing:2 }}>
-                PUBLIC INTEREST TRANSPARENCY PROJECT · ALL DATA IS PUBLIC RECORD
+              <div style={{ display:"flex", gap:10 }}>
+                {[["NJDG","https://njdg.ecourts.gov.in"],["SANSAD","https://sansad.in"],["MYNETA","https://myneta.info"]].map(([l,u])=>(
+                  <a key={l} href={u} target="_blank" rel="noreferrer"
+                    style={{ fontSize:7, color:DIM, letterSpacing:2,
+                      borderBottom:`1px solid ${DIM}44`, paddingBottom:1 }}>{l}</a>
+                ))}
               </div>
             </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );
